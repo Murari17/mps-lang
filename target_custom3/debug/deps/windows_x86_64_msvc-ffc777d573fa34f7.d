@@ -1,0 +1,7 @@
+C:\Users\murar\Desktop\mps lang\target_custom3\debug\deps\windows_x86_64_msvc-ffc777d573fa34f7.d: C:\Users\murar\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows_x86_64_msvc-0.52.6\src\lib.rs
+
+C:\Users\murar\Desktop\mps lang\target_custom3\debug\deps\libwindows_x86_64_msvc-ffc777d573fa34f7.rlib: C:\Users\murar\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows_x86_64_msvc-0.52.6\src\lib.rs
+
+C:\Users\murar\Desktop\mps lang\target_custom3\debug\deps\libwindows_x86_64_msvc-ffc777d573fa34f7.rmeta: C:\Users\murar\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows_x86_64_msvc-0.52.6\src\lib.rs
+
+C:\Users\murar\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows_x86_64_msvc-0.52.6\src\lib.rs:
