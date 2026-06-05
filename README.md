@@ -1,4 +1,4 @@
-# ⚡ Makes Python Slow (MPS)
+#  Makes Python Slow (MPS)
 
 **Makes Python Slow (MPS)** is a high-performance, zero-overhead, compiled programming language designed from scratch in Rust. It transpiles to compliant **ISO C11** to achieve near-C/C++ native speed while embedding the **CPython C FFI Runtime** to allow seamless, zero-overhead interoperability with any standard Python library (e.g. `numpy`, `pandas`, `math`, `sys`).
 
@@ -6,7 +6,7 @@ By utilizing dynamic, compile-time host Python discovery and combining it with a
 
 ---
 
-## 🏗️ Compiler Architecture
+##  Compiler Architecture
 
 The MPS compiler is divided into modular, zero-dependency stages written in Rust:
 
@@ -88,7 +88,7 @@ The MPS compiler is divided into modular, zero-dependency stages written in Rust
 
 ---
 
-## 🌟 Language Features
+##  Language Features
 
 ### Core Language
 | Feature | Syntax | Status |
@@ -198,22 +198,22 @@ Literal            ::= IntLiteral | FloatLiteral | StringLiteral | "true" | "fal
 
 ---
 
-## 🚀 Getting Started
+##  Getting Started
 
-### 📋 Prerequisites
+###  Prerequisites
 To build and run MPS, you will need:
 1.  **Rust Toolchain** (Cargo & `rustc`): [Install Rust](https://www.rust-lang.org/tools/install)
 2.  **C Compiler**: MSVC `cl.exe` (via Visual Studio Build Tools), GCC, or Clang.
 3.  **Python 3.x** *(optional)*: Only required if your `.mps` file uses `pyimport`. Programs without Python FFI compile without any Python dependency.
 
-### 🛠️ Building the Compiler
+###  Building the Compiler
 Navigate to the directory and compile the compiler in release mode:
 ```powershell
 cargo build --release
 ```
 The executable will be generated at `./target/release/mps.exe` (or `./target/release/mps` on Linux/macOS).
 
-### 🧪 Running Tests
+###  Running Tests
 To execute all 30+ comprehensive parser, lexer, typechecker, and optimizer unit tests:
 ```powershell
 cargo test
@@ -221,7 +221,7 @@ cargo test
 
 ---
 
-## 💻 Usage
+##  Usage
 
 ### Running an MPS Script
 Compile and run any `.mps` script immediately:
@@ -257,7 +257,7 @@ Options:
 
 ---
 
-## 🧪 Example Programs
+##  Example Programs
 
 ### 1. Hello World with Control Flow
 ```python
@@ -367,7 +367,7 @@ print(c)
 
 ---
 
-## 📦 Package Manager (`mps_pkg`)
+##  Package Manager (`mps_pkg`)
 
 MPS includes a lightweight, built-in package manager for dependency resolution:
 
@@ -390,7 +390,7 @@ Running `mps_pkg install` will:
 
 ---
 
-## 📁 Project Structure
+##  Project Structure
 
 ```
 new lang/
@@ -421,7 +421,7 @@ new lang/
 
 ---
 
-## 🔧 Technical Details
+##  Technical Details
 
 ### 1. Conditional Python Dependency
 `runtime.h` conditionally includes `<Python.h>` only when `MPS_USE_PYTHON` is defined. The codegen automatically emits this define when the program contains `pyimport` statements. Programs without Python FFI compile without any Python installation or libraries on the system.
