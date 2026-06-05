@@ -460,6 +460,6 @@ Native Windows thread pool using `CreateThread`, `CRITICAL_SECTION`, and `CONDIT
 
 ---
 
-## ⚖️ License
+##  License
 
 MPS is open-source software licensed under the **MIT License**.
