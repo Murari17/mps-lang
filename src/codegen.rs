@@ -30,6 +30,9 @@ pub struct Codegen {
     lambdas_code: String,
     async_tasks_code: String,
     async_functions: std::collections::HashSet<String>,
+    pub session_defined_funcs: std::collections::HashSet<String>,
+    pub session_defined_classes: std::collections::HashSet<String>,
+    pub is_repl_session: bool,
 }
 
 impl Codegen {
@@ -74,10 +77,18 @@ impl Codegen {
         func_env.insert("map".to_string(), Type::PyObject);
         func_env.insert("filter".to_string(), Type::PyObject);
         func_env.insert("len".to_string(), Type::Int);
+        func_env.insert("matrix_add".to_string(), Type::Custom("Matrix".to_string()));
+        func_env.insert("matrix_relu".to_string(), Type::Custom("Matrix".to_string()));
+        func_env.insert("matrix32_add".to_string(), Type::Custom("Matrix32".to_string()));
+        func_env.insert("matrix32_relu".to_string(), Type::Custom("Matrix32".to_string()));
+        func_env.insert("mps_random".to_string(), Type::Float);
+        func_env.insert("mps_randint".to_string(), Type::Int);
+        func_env.insert("mps_random_seed".to_string(), Type::Void);
+
         let mut var_env = HashMap::new();
         var_env.insert("MPS_PI".to_string(), Type::Float);
         var_env.insert("MPS_E".to_string(), Type::Float);
-
+ 
         Self {
             var_env,
             func_env,
@@ -92,6 +103,9 @@ impl Codegen {
             lambdas_code: String::new(),
             async_tasks_code: String::new(),
             async_functions: std::collections::HashSet::new(),
+            session_defined_funcs: std::collections::HashSet::new(),
+            session_defined_classes: std::collections::HashSet::new(),
+            is_repl_session: false,
         }
     }
 
@@ -113,7 +127,12 @@ impl Codegen {
         }
         if let Some(vars) = self.scope_matrix_vars.pop() {
             for v in vars.iter().rev() {
-                cleanups.push_str(&format!("{}matrix_free({});\n", self.indent(), v));
+                let is_m32 = self.var_env.get(v) == Some(&Type::Custom("Matrix32".to_string()));
+                if is_m32 {
+                    cleanups.push_str(&format!("{}matrix32_free({});\n", self.indent(), v));
+                } else {
+                    cleanups.push_str(&format!("{}matrix_free({});\n", self.indent(), v));
+                }
             }
         }
         cleanups
@@ -131,7 +150,12 @@ impl Codegen {
         for vars in self.scope_matrix_vars.iter().rev() {
             for v in vars.iter().rev() {
                 if Some(v.as_str()) != exclude_var {
-                    cleanups.push_str(&format!("{}matrix_free({});\n", self.indent(), v));
+                    let is_m32 = self.var_env.get(v) == Some(&Type::Custom("Matrix32".to_string()));
+                    if is_m32 {
+                        cleanups.push_str(&format!("{}matrix32_free({});\n", self.indent(), v));
+                    } else {
+                        cleanups.push_str(&format!("{}matrix_free({});\n", self.indent(), v));
+                    }
                 }
             }
         }
@@ -157,10 +181,29 @@ impl Codegen {
         escaped
     }
 
+    fn is_compatible(&self, declared: &Type, inferred: &Type) -> bool {
+        if declared == inferred {
+            return true;
+        }
+        if *declared == Type::PyObject || *inferred == Type::PyObject {
+            return true;
+        }
+        if (*declared == Type::Float && *inferred == Type::Float32) || (*declared == Type::Float32 && *inferred == Type::Float) {
+            return true;
+        }
+        if let Type::Optional(inner) = declared {
+            if **inner == *inferred {
+                return true;
+            }
+        }
+        false
+    }
+
     fn c_type(&self, t: &Type) -> String {
         match t {
             Type::Int => "int".to_string(),
             Type::Float => "double".to_string(),
+            Type::Float32 => "float".to_string(),
             Type::String => "const char*".to_string(),
             Type::Bool => "bool".to_string(),
             Type::Void => "void".to_string(),
@@ -177,6 +220,8 @@ impl Codegen {
             Type::Custom(name) => {
                 if name == "Matrix" {
                     "MPSMatrix*".to_string()
+                } else if name == "Matrix32" {
+                    "MPSMatrix32*".to_string()
                 } else if name == "Error" {
                     "MPS_Error".to_string()
                 } else if self.classes.contains_key(name) || name.starts_with("_args_") {
@@ -185,6 +230,23 @@ impl Codegen {
                     name.clone()
                 }
             }
+        }
+    }
+
+    fn binary_op_symbol(op: BinOp) -> Option<&'static str> {
+        match op {
+            BinOp::Add => Some("+"),
+            BinOp::Sub => Some("-"),
+            BinOp::Mul => Some("*"),
+            BinOp::Div => Some("/"),
+            BinOp::Percent => Some("%"),
+            BinOp::Eq => Some("=="),
+            BinOp::Ne => Some("!="),
+            BinOp::Lt => Some("<"),
+            BinOp::Le => Some("<="),
+            BinOp::Gt => Some(">"),
+            BinOp::Ge => Some(">="),
+            BinOp::Pow | BinOp::And | BinOp::Or => None,
         }
     }
 
@@ -230,6 +292,15 @@ impl Codegen {
 
     fn infer_type(&self, expr: &Expr) -> Result<Type, String> {
         match expr {
+            Expr::Slice { object, .. } => {
+                let obj_t = self.infer_type(object)?;
+                if obj_t == Type::String {
+                    Ok(Type::String)
+                } else {
+                    Ok(Type::PyObject)
+                }
+            }
+            Expr::ListComprehension { .. } => Ok(Type::PyObject),
             Expr::Literal(lit) => match lit {
                 Literal::Int(_) => Ok(Type::Int),
                 Literal::Float(_) => Ok(Type::Float),
@@ -292,6 +363,14 @@ impl Codegen {
                         } else if method == "mul" {
                             return Ok(Type::Optional(Box::new(Type::Custom("Matrix".to_string()))));
                         }
+                    } else if class_name == "Matrix32" {
+                        if method == "get" {
+                            return Ok(Type::Optional(Box::new(Type::Float32)));
+                        } else if method == "set" {
+                            return Ok(Type::Void);
+                        } else if method == "mul" {
+                            return Ok(Type::Optional(Box::new(Type::Custom("Matrix32".to_string()))));
+                        }
                     }
                     if let Some(info) = self.classes.get(class_name) {
                         if let Some(method_info) = info.methods.get(method) {
@@ -312,6 +391,8 @@ impl Codegen {
                 let left_t = self.infer_type(left)?;
                 let right_t = self.infer_type(right)?;
                 match op {
+                    BinOp::And | BinOp::Or => Ok(Type::Bool),
+                    BinOp::Pow => Ok(Type::Float),
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                         Ok(Type::Bool)
                     }
@@ -358,6 +439,9 @@ impl Codegen {
                 }
                 if name == "Matrix" {
                     return Ok(Type::Custom("Matrix".to_string()));
+                }
+                if name == "Matrix32" {
+                    return Ok(Type::Custom("Matrix32".to_string()));
                 }
                 if self.classes.contains_key(name) {
                     return Ok(Type::Custom(name.clone()));
@@ -411,6 +495,16 @@ impl Codegen {
                         } else {
                             return Err(format!("Type Error: Native Matrix does not have method '{}'", method));
                         }
+                    } else if class_name == "Matrix32" {
+                        if method == "get" {
+                            return Ok(Type::Float32);
+                        } else if method == "set" {
+                            return Ok(Type::Void);
+                        } else if method == "mul" {
+                            return Ok(Type::Custom("Matrix32".to_string()));
+                        } else {
+                            return Err(format!("Type Error: Native Matrix32 does not have method '{}'", method));
+                        }
                     }
                 }
                 if obj_t == Type::String {
@@ -452,6 +546,8 @@ impl Codegen {
                     Ok(Type::PyObject)
                 } else if obj_t == Type::Custom("Matrix".to_string()) {
                     Ok(Type::Float)
+                } else if obj_t == Type::Custom("Matrix32".to_string()) {
+                    Ok(Type::Float32)
                 } else if obj_t == Type::String {
                     Ok(Type::String)
                 } else {
@@ -628,7 +724,7 @@ impl Codegen {
                 }
             }
             forward_methods.push_str(&format!(
-                "{}* {}_new({});\n",
+                "MPS_EXPORT {}* {}_new({});\n",
                 class_name,
                 class_name,
                 init_args.join(", ")
@@ -645,7 +741,7 @@ impl Codegen {
                     }
                 }
                 forward_methods.push_str(&format!(
-                    "{} {}_{}({});\n",
+                    "MPS_EXPORT {} {}_{}({});\n",
                     self.c_type(&m_info.return_type),
                     class_name,
                     m_name,
@@ -663,10 +759,10 @@ impl Codegen {
                 }
                 if *is_async {
                     forward_methods.push_str(&format!("typedef struct _args_{} _args_{};\n", name, name));
-                    forward_methods.push_str(&format!("{} _impl_{}({});\n", self.c_type(return_type), name, init_args.join(", ")));
-                    forward_methods.push_str(&format!("_args_{}* {}({});\n", name, name, init_args.join(", ")));
+                    forward_methods.push_str(&format!("MPS_EXPORT {} _impl_{}({});\n", self.c_type(return_type), name, init_args.join(", ")));
+                    forward_methods.push_str(&format!("MPS_EXPORT _args_{}* {}({});\n", name, name, init_args.join(", ")));
                 } else {
-                    forward_methods.push_str(&format!("{} {}({});\n", self.c_type(return_type), name, init_args.join(", ")));
+                    forward_methods.push_str(&format!("MPS_EXPORT {} {}({});\n", self.c_type(return_type), name, init_args.join(", ")));
                 }
             }
         }
@@ -679,7 +775,10 @@ impl Codegen {
         // Transpilation of functions and classes
         for stmt in &program.statements {
             match stmt {
-                Stmt::FunctionDecl { name, params, return_type, body, is_async } => {
+                Stmt::FunctionDecl { name, params, return_type, body, is_async, .. } => {
+                    if self.session_defined_funcs.contains(name) {
+                        continue;
+                    }
                     if *is_async {
                         // Transpile async task wrapper & structures
                         let mut arg_struct = format!("struct _args_{} {{\n", name);
@@ -739,6 +838,9 @@ impl Codegen {
                     }
                 }
                 Stmt::ClassDecl { name, members, .. } => {
+                    if self.session_defined_classes.contains(name) {
+                        continue;
+                    }
                     self.current_class = Some(name.clone());
                     
                     // Transpile methods
@@ -797,12 +899,21 @@ impl Codegen {
         if self.has_py_imports {
             header.push_str("#define MPS_USE_PYTHON\n");
         }
+        header.push_str("#ifndef MPS_EXPORT\n");
+        header.push_str("#if defined(_WIN32) && defined(MPS_EMIT_SO)\n");
+        header.push_str("#define MPS_EXPORT __declspec(dllexport)\n");
+        header.push_str("#elif defined(MPS_EMIT_SO)\n");
+        header.push_str("#define MPS_EXPORT __attribute__((visibility(\"default\")))\n");
+        header.push_str("#else\n");
+        header.push_str("#define MPS_EXPORT\n");
+        header.push_str("#endif\n");
+        header.push_str("#endif\n");
         header.push_str("#include \"runtime.h\"\n\n");
 
         let mut top_level_code = String::new();
 
         // Generate main function
-        if !top_level_statements.is_empty() || self.has_py_imports {
+        if (!top_level_statements.is_empty() || self.has_py_imports) && !self.is_repl_session {
             if self.func_env.contains_key("main") {
                 return Err("Compilation Error: Cannot have both top-level statements and an explicit 'main' function definition.".into());
             }
@@ -951,11 +1062,55 @@ impl Codegen {
 
     fn transpile_statement(&mut self, stmt: &Stmt) -> Result<String, String> {
         match stmt {
+            Stmt::TupleUnpack { vars, init } => {
+                let mut block_statements = Vec::new();
+                self.enter_block();
+                let init_code = self.flatten_expression(init, &mut block_statements)?;
+                let cleanups = self.exit_block();
+
+                self.temp_counter += 1;
+                let temp_name = format!("_tmp_unpack_{}", self.temp_counter);
+
+                let mut out = String::new();
+                if !block_statements.is_empty() {
+                    out.push_str(&format!("{}{{\n", self.indent()));
+                    self.indent_level += 1;
+                    for s in &block_statements {
+                        out.push_str(&format!("{}{}\n", self.indent(), s));
+                    }
+                }
+
+                out.push_str(&format!("{}PyObject* {} = to_py({});\n", self.indent(), temp_name, init_code));
+
+                for (i, var_name) in vars.iter().enumerate() {
+                    self.var_env.insert(var_name.clone(), Type::PyObject);
+                    if let Some(scope) = self.scope_py_vars.last_mut() {
+                        scope.push(var_name.clone());
+                    }
+                    out.push_str(&format!(
+                        "{}PyObject* {} = PySequence_GetItem({}, {});\n",
+                        self.indent(),
+                        var_name,
+                        temp_name,
+                        i
+                    ));
+                }
+
+                out.push_str(&format!("{}Py_XDECREF({});\n", self.indent(), temp_name));
+
+                if !block_statements.is_empty() {
+                    out.push_str(&cleanups);
+                    self.indent_level -= 1;
+                    out.push_str(&format!("{}}}\n", self.indent()));
+                }
+
+                Ok(out)
+            }
             Stmt::VariableDecl { name, is_const, var_type, init } => {
                 let inferred = if let Some(init_expr) = init {
                     let inf = self.infer_type(init_expr)?;
                     if let Some(declared) = var_type {
-                        if *declared != inf {
+                        if !self.is_compatible(declared, &inf) {
                             return Err(format!(
                                 "Type Error: Declared type '{}' for variable '{}' does not match initializer type '{}'",
                                 declared, name, inf
@@ -973,7 +1128,7 @@ impl Codegen {
                     if let Some(scope) = self.scope_py_vars.last_mut() {
                         scope.push(name.clone());
                     }
-                } else if inferred == Type::Custom("Matrix".to_string()) {
+                } else if inferred == Type::Custom("Matrix".to_string()) || inferred == Type::Custom("Matrix32".to_string()) {
                     if let Some(scope) = self.scope_matrix_vars.last_mut() {
                         scope.push(name.clone());
                     }
@@ -984,7 +1139,7 @@ impl Codegen {
                     let mut block_statements = Vec::new();
                     self.enter_block();
                     let init_code = self.flatten_expression(init_expr, &mut block_statements)?;
-                    if inferred == Type::Custom("Matrix".to_string()) && init_code.starts_with("_tmp_") {
+                    if (inferred == Type::Custom("Matrix".to_string()) || inferred == Type::Custom("Matrix32".to_string())) && init_code.starts_with("_tmp_") {
                         if let Some(scope) = self.scope_matrix_vars.last_mut() {
                             if let Some(pos) = scope.iter().position(|x| x == &init_code) {
                                 scope.remove(pos);
@@ -1055,7 +1210,7 @@ impl Codegen {
                         };
 
                         let val_t = self.infer_type(value)?;
-                        if var_t != val_t && var_t != Type::PyObject {
+                        if !self.is_compatible(&var_t, &val_t) {
                             return Err(format!(
                                 "Type Error: Cannot assign value of type '{}' to variable '{}' of type '{}'",
                                 val_t, name, var_t
@@ -1065,7 +1220,7 @@ impl Codegen {
                         let mut block_statements = Vec::new();
                         self.enter_block();
                         let val_code = self.flatten_expression(value, &mut block_statements)?;
-                        if var_t == Type::Custom("Matrix".to_string()) && val_code.starts_with("_tmp_") {
+                        if (var_t == Type::Custom("Matrix".to_string()) || var_t == Type::Custom("Matrix32".to_string())) && val_code.starts_with("_tmp_") {
                             if let Some(scope) = self.scope_matrix_vars.last_mut() {
                                 if let Some(pos) = scope.iter().position(|x| x == &val_code) {
                                     scope.remove(pos);
@@ -1107,7 +1262,7 @@ impl Codegen {
                         if let Type::Custom(class_name) = obj_t {
                             if let Some((prop_t, access_path)) = self.resolve_property(&class_name, member) {
                                 let val_t = self.infer_type(value)?;
-                                if prop_t != val_t {
+                                if !self.is_compatible(&prop_t, &val_t) {
                                     return Err(format!(
                                         "Type Error: Cannot assign value of type '{}' to property '{}' of type '{}'",
                                         val_t, member, prop_t
@@ -1808,6 +1963,28 @@ impl Codegen {
                 let left_t = self.infer_type(left)?;
                 let right_t = self.infer_type(right)?;
 
+                if *op == BinOp::And || *op == BinOp::Or {
+                    let left_code = self.flatten_expression(left, block_statements)?;
+                    self.temp_counter += 1;
+                    let temp_name = format!("_tmp_{}", self.temp_counter);
+                    block_statements.push(format!("bool {} = false;", temp_name));
+                    if *op == BinOp::And {
+                        block_statements.push(format!("if ({}) {{", left_code));
+                    } else {
+                        block_statements.push(format!("if (!({})) {{", left_code));
+                    }
+                    let right_code = self.flatten_expression(right, block_statements)?;
+                    block_statements.push(format!("{} = {};", temp_name, right_code));
+                    block_statements.push("}".to_string());
+                    return Ok(temp_name);
+                }
+
+                if *op == BinOp::Pow {
+                    let left_code = self.flatten_expression(left, block_statements)?;
+                    let right_code = self.flatten_expression(right, block_statements)?;
+                    return Ok(format!("mps_pow({}, {})", left_code, right_code));
+                }
+
                 // String concatenation: string + anything → mps_str_concat
                 if *op == BinOp::Add && (left_t == Type::String || right_t == Type::String) {
                     let left_code = self.flatten_expression(left, block_statements)?;
@@ -1838,6 +2015,7 @@ impl Codegen {
                         BinOp::Le => Some("le"),
                         BinOp::Gt => Some("gt"),
                         BinOp::Ge => Some("ge"),
+                        BinOp::Pow | BinOp::And | BinOp::Or => None,
                     };
                     if let Some(method_name) = op_method {
                         if self.resolve_method(class_name, method_name).is_some() {
@@ -1853,19 +2031,7 @@ impl Codegen {
 
                 let left_code = self.flatten_expression(left, block_statements)?;
                 let right_code = self.flatten_expression(right, block_statements)?;
-                let op_str = match op {
-                    BinOp::Add => "+",
-                    BinOp::Sub => "-",
-                    BinOp::Mul => "*",
-                    BinOp::Div => "/",
-                    BinOp::Percent => "%",
-                    BinOp::Eq => "==",
-                    BinOp::Ne => "!=",
-                    BinOp::Lt => "<",
-                    BinOp::Le => "<=",
-                    BinOp::Gt => ">",
-                    BinOp::Ge => ">=",
-                };
+                let op_str = Self::binary_op_symbol(*op).unwrap();
                 Ok(format!("({} {} {})", left_code, op_str, right_code))
             }
             Expr::Call { name, args } => {
@@ -1885,6 +2051,14 @@ impl Codegen {
                         arg_codes.push(self.flatten_expression(arg, block_statements)?);
                     }
                     return Ok(format!("matrix_new({})", arg_codes.join(", ")));
+                }
+
+                if name == "Matrix32" {
+                    let mut arg_codes = Vec::new();
+                    for arg in args {
+                        arg_codes.push(self.flatten_expression(arg, block_statements)?);
+                    }
+                    return Ok(format!("matrix32_new({})", arg_codes.join(", ")));
                 }
 
                 // map(list, fn) → inline loop building new list
@@ -1985,6 +2159,14 @@ impl Codegen {
                                 scope.push(temp_name.clone());
                             }
                             return Ok(temp_name);
+                        } else if **return_type == Type::Custom("Matrix32".to_string()) {
+                            self.temp_counter += 1;
+                            let temp_name = format!("_tmp_{}", self.temp_counter);
+                            block_statements.push(format!("MPSMatrix32* {} = {};", temp_name, call_code));
+                            if let Some(scope) = self.scope_matrix_vars.last_mut() {
+                                scope.push(temp_name.clone());
+                            }
+                            return Ok(temp_name);
                         } else {
                             return Ok(call_code);
                         }
@@ -2005,6 +2187,14 @@ impl Codegen {
                     self.temp_counter += 1;
                     let temp_name = format!("_tmp_{}", self.temp_counter);
                     block_statements.push(format!("MPSMatrix* {} = {};", temp_name, call_code));
+                    if let Some(scope) = self.scope_matrix_vars.last_mut() {
+                        scope.push(temp_name.clone());
+                    }
+                    Ok(temp_name)
+                } else if return_t == Type::Custom("Matrix32".to_string()) {
+                    self.temp_counter += 1;
+                    let temp_name = format!("_tmp_{}", self.temp_counter);
+                    block_statements.push(format!("MPSMatrix32* {} = {};", temp_name, call_code));
                     if let Some(scope) = self.scope_matrix_vars.last_mut() {
                         scope.push(temp_name.clone());
                     }
@@ -2094,6 +2284,27 @@ impl Codegen {
                         } else {
                             return Err(format!("Compilation Error: Native Matrix does not have method '{}'", method));
                         }
+                    } else if class_name == "Matrix32" {
+                        let mut arg_codes = Vec::new();
+                        for arg in args {
+                            arg_codes.push(self.flatten_expression(arg, block_statements)?);
+                        }
+                        if method == "get" {
+                            return Ok(format!("matrix32_get({}, {})", obj_code, arg_codes.join(", ")));
+                        } else if method == "set" {
+                            return Ok(format!("matrix32_set({}, {})", obj_code, arg_codes.join(", ")));
+                        } else if method == "mul" {
+                            let call_code = format!("matrix32_mul({}, {})", obj_code, arg_codes.join(", "));
+                            self.temp_counter += 1;
+                            let temp_name = format!("_tmp_{}", self.temp_counter);
+                            block_statements.push(format!("MPSMatrix32* {} = {};", temp_name, call_code));
+                            if let Some(scope) = self.scope_matrix_vars.last_mut() {
+                                scope.push(temp_name.clone());
+                            }
+                            return Ok(temp_name);
+                        } else {
+                            return Err(format!("Compilation Error: Native Matrix32 does not have method '{}'", method));
+                        }
                     }
                     if let Some((def_class, cast)) = self.resolve_method(&class_name, method) {
                         let mut arg_codes = Vec::new();
@@ -2158,7 +2369,9 @@ impl Codegen {
                     }
                     Ok(temp_name)
                 } else if obj_t == Type::Custom("Matrix".to_string()) {
-                    Ok(format!("{}[{}]", obj_code, index_code))
+                    Ok(format!("{}->data[{}]", obj_code, index_code))
+                } else if obj_t == Type::Custom("Matrix32".to_string()) {
+                    Ok(format!("{}->data[{}]", obj_code, index_code))
                 } else if obj_t == Type::String {
                     Ok(format!("mps_str_get_char({}, {})", obj_code, index_code))
                 } else {
@@ -2278,6 +2491,103 @@ impl Codegen {
                 }
             }
             Expr::Super => Ok("((PyObject*)self)".to_string()),
+            Expr::Slice { object, start, end } => {
+                let obj_code = self.flatten_expression(object, block_statements)?;
+                let obj_t = self.infer_type(object)?;
+                
+                self.temp_counter += 1;
+                let temp_name = format!("_tmp_slice_{}", self.temp_counter);
+                
+                if obj_t == Type::String {
+                    let s_val = if let Some(s) = start {
+                        self.flatten_expression(s, block_statements)?
+                    } else {
+                        "-1".to_string()
+                    };
+                    let e_val = if let Some(e) = end {
+                        self.flatten_expression(e, block_statements)?
+                    } else {
+                        "-1".to_string()
+                    };
+                    block_statements.push(format!("const char* {} = mps_str_slice({}, {}, {});", temp_name, obj_code, s_val, e_val));
+                    return Ok(temp_name);
+                } else {
+                    let s_obj = if let Some(s) = start {
+                        let sc = self.flatten_expression(s, block_statements)?;
+                        format!("to_py({})", sc)
+                    } else {
+                        "Py_None".to_string()
+                    };
+                    let e_obj = if let Some(e) = end {
+                        let ec = self.flatten_expression(e, block_statements)?;
+                        format!("to_py({})", ec)
+                    } else {
+                        "Py_None".to_string()
+                    };
+                    block_statements.push(format!("PyObject* _slice_spec_{} = PySlice_New({}, {}, NULL);", self.temp_counter, s_obj, e_obj));
+                    block_statements.push(format!("PyObject* {} = PyObject_GetItem(to_py({}), _slice_spec_{});", temp_name, obj_code, self.temp_counter));
+                    block_statements.push(format!("Py_XDECREF(_slice_spec_{});", self.temp_counter));
+                    
+                    if let Some(scope) = self.scope_py_vars.last_mut() {
+                        scope.push(temp_name.clone());
+                    }
+                    return Ok(temp_name);
+                }
+            }
+            Expr::ListComprehension { element, var_name, iterable } => {
+                let iter_code = self.flatten_expression(iterable, block_statements)?;
+                
+                self.temp_counter += 1;
+                let list_name = format!("_list_comp_{}", self.temp_counter);
+                
+                block_statements.push(format!("PyObject* {} = PyList_New(0);", list_name));
+                
+                if let Some(scope) = self.scope_py_vars.last_mut() {
+                    scope.push(list_name.clone());
+                }
+                
+                self.temp_counter += 1;
+                let iter_name = format!("_iter_{}", self.temp_counter);
+                self.temp_counter += 1;
+                let item_name = format!("_item_{}", self.temp_counter);
+                
+                block_statements.push(format!("PyObject* {} = PyObject_GetIter(to_py({}));", iter_name, iter_code));
+                block_statements.push(format!("if ({} != NULL) {{", iter_name));
+                block_statements.push(format!("    PyObject* {} = NULL;", item_name));
+                block_statements.push(format!("    while (({} = PyIter_Next({})) != NULL) {{", item_name, iter_name));
+                
+                let outer_var_env = self.var_env.clone();
+                self.var_env.insert(var_name.clone(), Type::PyObject);
+                self.enter_block();
+                if let Some(scope) = self.scope_py_vars.last_mut() {
+                    scope.push(var_name.clone());
+                }
+                
+                let mut loop_body = Vec::new();
+                loop_body.push(format!("PyObject* {} = {};", var_name, item_name));
+                loop_body.push(format!("Py_XINCREF({});", var_name));
+                
+                let elem_code = self.flatten_expression(element, &mut loop_body)?;
+                loop_body.push(format!("PyObject* _mapped_val = to_py({});", elem_code));
+                loop_body.push(format!("PyList_Append({}, _mapped_val);", list_name));
+                loop_body.push("Py_XDECREF(_mapped_val);".to_string());
+                
+                let cleanups_loop = self.exit_block();
+                self.var_env = outer_var_env;
+                
+                for line in loop_body {
+                    block_statements.push(format!("        {}", line));
+                }
+                for line in cleanups_loop.lines() {
+                    block_statements.push(format!("        {}", line));
+                }
+                block_statements.push(format!("        Py_DECREF({});", item_name));
+                block_statements.push("    }".to_string());
+                block_statements.push(format!("    Py_DECREF({});", iter_name));
+                block_statements.push("}".to_string());
+                
+                Ok(list_name)
+            }
         }
     }
 
@@ -2314,6 +2624,7 @@ impl Codegen {
                         BinOp::Le => Some("le"),
                         BinOp::Gt => Some("gt"),
                         BinOp::Ge => Some("ge"),
+                        BinOp::Pow | BinOp::And | BinOp::Or => None,
                     };
                     if let Some(method_name) = op_method {
                         if self.resolve_method(class_name, method_name).is_some() {
@@ -2331,6 +2642,9 @@ impl Codegen {
                 let right_t = self.infer_type(right)?;
 
                 match op {
+                    BinOp::And => Ok(format!("({} && {})", left_code, right_code)),
+                    BinOp::Or => Ok(format!("({} || {})", left_code, right_code)),
+                    BinOp::Pow => Ok(format!("mps_pow({}, {})", left_code, right_code)),
                     BinOp::Add => {
                         if left_t == Type::String || right_t == Type::String {
                             let left_coerced = if left_t == Type::String { left_code } else { format!("mps_to_string({})", left_code) };
@@ -2344,6 +2658,8 @@ impl Codegen {
                     BinOp::Mul => {
                         if left_t == Type::Custom("Matrix".to_string()) && right_t == Type::Custom("Matrix".to_string()) {
                             Ok(format!("matrix_mul({}, {})", left_code, right_code))
+                        } else if left_t == Type::Custom("Matrix32".to_string()) && right_t == Type::Custom("Matrix32".to_string()) {
+                            Ok(format!("matrix32_mul({}, {})", left_code, right_code))
                         } else {
                             Ok(format!("({} * {})", left_code, right_code))
                         }
@@ -2514,7 +2830,7 @@ impl Codegen {
                     Ok(format!("{}[{}]", obj_code, index_code))
                 }
             }
-            Expr::ListLiteral(_) | Expr::DictLiteral(_) | Expr::TupleLiteral(_) | Expr::SuperCall { .. } | Expr::Lambda { .. } | Expr::AwaitExpr(_) | Expr::OptionalMemberAccess { .. } | Expr::OptionalMemberCall { .. } | Expr::FString { .. } => {
+            Expr::ListLiteral(_) | Expr::DictLiteral(_) | Expr::TupleLiteral(_) | Expr::SuperCall { .. } | Expr::Lambda { .. } | Expr::AwaitExpr(_) | Expr::OptionalMemberAccess { .. } | Expr::OptionalMemberCall { .. } | Expr::FString { .. } | Expr::Slice { .. } | Expr::ListComprehension { .. } => {
                 Err("Internal Error: Flattened expression variants cannot be transpiled directly.".into())
             }
             Expr::Super => Ok("((PyObject*)self)".to_string()),

@@ -63,6 +63,13 @@ impl TypeChecker {
         functions.insert("filter".to_string(), (vec![Type::PyObject, Type::Void], Type::PyObject));
         functions.insert("reduce".to_string(), (vec![Type::PyObject, Type::Void, Type::Void], Type::PyObject));
         functions.insert("len".to_string(), (vec![Type::PyObject], Type::Int));
+        functions.insert("matrix_add".to_string(), (vec![Type::Custom("Matrix".to_string()), Type::Custom("Matrix".to_string())], Type::Custom("Matrix".to_string())));
+        functions.insert("matrix_relu".to_string(), (vec![Type::Custom("Matrix".to_string())], Type::Custom("Matrix".to_string())));
+        functions.insert("matrix32_add".to_string(), (vec![Type::Custom("Matrix32".to_string()), Type::Custom("Matrix32".to_string())], Type::Custom("Matrix32".to_string())));
+        functions.insert("matrix32_relu".to_string(), (vec![Type::Custom("Matrix32".to_string())], Type::Custom("Matrix32".to_string())));
+        functions.insert("mps_random".to_string(), (vec![], Type::Float));
+        functions.insert("mps_randint".to_string(), (vec![Type::Int, Type::Int], Type::Int));
+        functions.insert("mps_random_seed".to_string(), (vec![Type::Int], Type::Void));
 
         let mut global_scope = HashMap::new();
         global_scope.insert("MPS_PI".to_string(), Type::Float);
@@ -83,6 +90,9 @@ impl TypeChecker {
             return true;
         }
         if *declared == Type::PyObject || *inferred == Type::PyObject {
+            return true;
+        }
+        if (*declared == Type::Float && *inferred == Type::Float32) || (*declared == Type::Float32 && *inferred == Type::Float) {
             return true;
         }
         if let Type::Optional(_) = declared {
@@ -395,6 +405,12 @@ impl TypeChecker {
                 }
                 self.exit_scope();
             }
+            Stmt::TupleUnpack { vars, init } => {
+                let _init_t = self.infer_expr_type(init)?;
+                for var_name in vars {
+                    self.declare(var_name.clone(), Type::PyObject)?;
+                }
+            }
             Stmt::ExprStmt(expr) => {
                 self.infer_expr_type(expr)?;
             }
@@ -514,6 +530,8 @@ impl TypeChecker {
                 let left_t = self.infer_expr_type(left)?;
                 let right_t = self.infer_expr_type(right)?;
                 match op {
+                    BinOp::And | BinOp::Or => Ok(Type::Bool),
+                    BinOp::Pow => Ok(Type::Float),
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                         Ok(Type::Bool)
                     }
@@ -523,6 +541,8 @@ impl TypeChecker {
                             Ok(Type::String)
                         } else if left_t == Type::Float || right_t == Type::Float {
                             Ok(Type::Float)
+                        } else if left_t == Type::Float32 || right_t == Type::Float32 {
+                            Ok(Type::Float32)
                         } else if left_t == Type::Int && right_t == Type::Int {
                             Ok(Type::Int)
                         } else {
@@ -684,6 +704,30 @@ impl TypeChecker {
                 } else {
                     Ok(Type::PyObject)
                 }
+            }
+            Expr::Slice { object, start, end } => {
+                let obj_t = self.infer_expr_type(object)?;
+                if let Some(s) = start {
+                    let st = self.infer_expr_type(s)?;
+                    if st != Type::Int {
+                        return Err(format!("Slice index must be an integer, found '{}'", st));
+                    }
+                }
+                if let Some(e) = end {
+                    let et = self.infer_expr_type(e)?;
+                    if et != Type::Int {
+                        return Err(format!("Slice index must be an integer, found '{}'", et));
+                    }
+                }
+                if obj_t == Type::String {
+                    Ok(Type::String)
+                } else {
+                    Ok(Type::PyObject)
+                }
+            }
+            Expr::ListComprehension { element: _, var_name: _, iterable } => {
+                let _iter_t = self.infer_expr_type(iterable)?;
+                Ok(Type::PyObject)
             }
             Expr::ListLiteral(_) => Ok(Type::PyObject),
             Expr::DictLiteral(_) => Ok(Type::PyObject),

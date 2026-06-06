@@ -96,13 +96,14 @@ impl Optimizer {
 
     fn fold_statement(stmt: Stmt) -> Stmt {
         match stmt {
-            Stmt::FunctionDecl { name, params, return_type, body, is_async } => {
+            Stmt::FunctionDecl { name, params, return_type, body, is_async, decorators } => {
                 Stmt::FunctionDecl {
                     name,
                     params,
                     return_type,
                     body: Self::optimize_block(body),
                     is_async,
+                    decorators,
                 }
             }
             Stmt::ClassDecl { name, base_class, members } => {
@@ -167,6 +168,12 @@ impl Optimizer {
                     }).collect(),
                 }
             }
+            Stmt::TupleUnpack { vars, init } => {
+                Stmt::TupleUnpack {
+                    vars,
+                    init: Self::fold_expression(init),
+                }
+            }
             Stmt::ExprStmt(expr) => Stmt::ExprStmt(Self::fold_expression(expr)),
             Stmt::ReturnStmt(opt_expr) => Stmt::ReturnStmt(opt_expr.map(|e| Self::fold_expression(e))),
             other => other,
@@ -205,6 +212,9 @@ impl Optimizer {
                             BinOp::Le => Expr::Literal(Literal::Bool(a <= b)),
                             BinOp::Gt => Expr::Literal(Literal::Bool(a > b)),
                             BinOp::Ge => Expr::Literal(Literal::Bool(a >= b)),
+                            BinOp::Pow | BinOp::And | BinOp::Or => {
+                                Expr::Binary { op, left: Box::new(left_folded), right: Box::new(right_folded) }
+                            }
                         }
                     }
                     (Expr::Literal(Literal::Float(a)), Expr::Literal(Literal::Float(b))) => {
@@ -232,6 +242,9 @@ impl Optimizer {
                             BinOp::Le => Expr::Literal(Literal::Bool(a <= b)),
                             BinOp::Gt => Expr::Literal(Literal::Bool(a > b)),
                             BinOp::Ge => Expr::Literal(Literal::Bool(a >= b)),
+                            BinOp::Pow | BinOp::And | BinOp::Or => {
+                                Expr::Binary { op, left: Box::new(left_folded), right: Box::new(right_folded) }
+                            }
                         }
                     }
                     (Expr::Literal(Literal::Int(a)), Expr::Literal(Literal::Float(b))) => {
@@ -260,6 +273,9 @@ impl Optimizer {
                             BinOp::Le => Expr::Literal(Literal::Bool(af <= *b)),
                             BinOp::Gt => Expr::Literal(Literal::Bool(af > *b)),
                             BinOp::Ge => Expr::Literal(Literal::Bool(af >= *b)),
+                            BinOp::Pow | BinOp::And | BinOp::Or => {
+                                Expr::Binary { op, left: Box::new(left_folded), right: Box::new(right_folded) }
+                            }
                         }
                     }
                     (Expr::Literal(Literal::Float(a)), Expr::Literal(Literal::Int(b))) => {
@@ -288,6 +304,9 @@ impl Optimizer {
                             BinOp::Le => Expr::Literal(Literal::Bool(*a <= bf)),
                             BinOp::Gt => Expr::Literal(Literal::Bool(*a > bf)),
                             BinOp::Ge => Expr::Literal(Literal::Bool(*a >= bf)),
+                            BinOp::Pow | BinOp::And | BinOp::Or => {
+                                Expr::Binary { op, left: Box::new(left_folded), right: Box::new(right_folded) }
+                            }
                         }
                     }
                     (Expr::Literal(Literal::Bool(a)), Expr::Literal(Literal::Bool(b))) => {
@@ -377,6 +396,20 @@ impl Optimizer {
                     }).collect(),
                 }
             }
+            Expr::Slice { object, start, end } => {
+                Expr::Slice {
+                    object: Box::new(Self::fold_expression(*object)),
+                    start: start.map(|e| Box::new(Self::fold_expression(*e))),
+                    end: end.map(|e| Box::new(Self::fold_expression(*e))),
+                }
+            }
+            Expr::ListComprehension { element, var_name, iterable } => {
+                Expr::ListComprehension {
+                    element: Box::new(Self::fold_expression(*element)),
+                    var_name,
+                    iterable: Box::new(Self::fold_expression(*iterable)),
+                }
+            }
             other => other,
         }
     }
@@ -398,6 +431,14 @@ impl Optimizer {
                 FStringPart::Text(_) => true,
                 FStringPart::Expr(e) => Self::is_pure_expr(e),
             }),
+            Expr::Slice { object, start, end } => {
+                Self::is_pure_expr(object)
+                    && start.as_ref().map_or(true, |e| Self::is_pure_expr(e))
+                    && end.as_ref().map_or(true, |e| Self::is_pure_expr(e))
+            }
+            Expr::ListComprehension { element, iterable, .. } => {
+                Self::is_pure_expr(element) && Self::is_pure_expr(iterable)
+            }
             _ => false,
         }
     }
@@ -451,6 +492,9 @@ impl Optimizer {
             }
             Stmt::RaiseStmt(expr) => {
                 Self::find_var_references_in_expr(expr, refs);
+            }
+            Stmt::TupleUnpack { init, .. } => {
+                Self::find_var_references_in_expr(init, refs);
             }
             Stmt::MatchStmt { value, cases } => {
                 Self::find_var_references_in_expr(value, refs);
@@ -560,6 +604,19 @@ impl Optimizer {
                         Self::find_var_references_in_expr(e, refs);
                     }
                 }
+            }
+            Expr::Slice { object, start, end } => {
+                Self::find_var_references_in_expr(object, refs);
+                if let Some(s) = start {
+                    Self::find_var_references_in_expr(s, refs);
+                }
+                if let Some(e) = end {
+                    Self::find_var_references_in_expr(e, refs);
+                }
+            }
+            Expr::ListComprehension { element, iterable, .. } => {
+                Self::find_var_references_in_expr(element, refs);
+                Self::find_var_references_in_expr(iterable, refs);
             }
         }
     }

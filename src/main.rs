@@ -13,6 +13,7 @@ use codegen::Codegen;
 
 use std::env;
 use std::fs;
+use std::io::{Read, Write, BufRead};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -106,24 +107,42 @@ fn print_usage() {
     println!("Makes Python Slow (MPS) Compiler v0.1.0");
     println!("Usage:");
     println!("  mps [source_file.mps] [options]");
+    println!("  mps [subcommand] [arguments]");
     println!();
     println!("Options:");
     println!("  --run                Compile and run the program immediately");
     println!("  --emit-c             Output transpiled C code (no compilation)");
     println!("  --emit-ast           Print parsed AST to stdout");
+    println!("  --emit-so            Output a shared library (.dll or .so) instead of an executable");
     println!("  -o, --output <path>  Specify output binary path");
     println!("  -i, --repl           Start the interactive REPL shell");
     println!("  -h, --help           Show this help message");
+    println!();
+    println!("Subcommands:");
+    println!("  lsp                  Start the stdio-based LSP server");
+    println!("  format [files...]    Pretty-print and format the specified MPS files in place");
 }
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+    
+    if args.len() > 1 {
+        if args[1] == "lsp" {
+            run_lsp();
+            return;
+        }
+        if args[1] == "format" {
+            run_formatter(&args[2..]);
+            return;
+        }
+    }
     
     let mut source_path_str: Option<&String> = None;
     let mut interactive = false;
     let mut should_run = false;
     let mut emit_c = false;
     let mut emit_ast = false;
+    let mut emit_so = false;
     let mut output_bin_path: Option<PathBuf> = None;
 
     let mut i = 1;
@@ -147,6 +166,10 @@ fn main() {
             }
             "--emit-ast" => {
                 emit_ast = true;
+                i += 1;
+            }
+            "--emit-so" => {
+                emit_so = true;
                 i += 1;
             }
             "-o" | "--output" => {
@@ -237,10 +260,17 @@ fn main() {
     // Determine output binary path if not specified
     let output_bin = output_bin_path.unwrap_or_else(|| {
         let mut p = source_path.to_path_buf();
-        #[cfg(target_os = "windows")]
-        p.set_extension("exe");
-        #[cfg(not(target_os = "windows"))]
-        p.set_extension("");
+        if emit_so {
+            #[cfg(target_os = "windows")]
+            p.set_extension("dll");
+            #[cfg(not(target_os = "windows"))]
+            p.set_extension("so");
+        } else {
+            #[cfg(target_os = "windows")]
+            p.set_extension("exe");
+            #[cfg(not(target_os = "windows"))]
+            p.set_extension("");
+        }
         p
     });
 
@@ -341,8 +371,13 @@ fn main() {
             let mut cmd = Command::new("cl");
             cmd.arg("/std:c11")
                .arg("/O2")
+               .arg("/fp:fast")
                .arg(format!("/Fe:{}", output_bin.display()))
                .arg(&temp_c_path);
+            
+            if emit_so {
+                cmd.arg("/LD").arg("/DMPS_EMIT_SO");
+            }
             
             if has_py_imports {
                 if let Some(paths) = discover_python_paths() {
@@ -362,7 +397,8 @@ fn main() {
                 use std::os::windows::process::CommandExt;
                 let mut cmd = Command::new("cmd");
                 let vcvars_path = find_vcvars().unwrap();
-                let mut cl_cmd = format!("call \"{}\" && cl /std:c11 /O2 /Fe:\"{}\" \"{}\"", vcvars_path, output_bin.display(), temp_c_path.display());
+                let extra_flags = if emit_so { " /LD /DMPS_EMIT_SO" } else { "" };
+                let mut cl_cmd = format!("call \"{}\" && cl /std:c11 /O2 /fp:fast{} /Fe:\"{}\" \"{}\"", vcvars_path, extra_flags, output_bin.display(), temp_c_path.display());
                 if has_py_imports {
                     if let Some(paths) = discover_python_paths() {
                         cl_cmd.push_str(&format!(" /I\"{}\" /link /LIBPATH:\"{}\" \"{}.lib\"", paths.include_dir, paths.libs_dir, paths.lib_name));
@@ -381,9 +417,15 @@ fn main() {
             println!("[MPS] Compiling C using {} -O3...", cc);
             let mut cmd = Command::new(cc);
             cmd.arg("-O3")
+               .arg("-ffast-math")
+               .arg("-march=native")
                .arg(&temp_c_path)
                .arg("-o")
                .arg(&output_bin);
+
+            if emit_so {
+                cmd.arg("-shared").arg("-fPIC").arg("-DMPS_EMIT_SO");
+            }
 
             if has_py_imports {
                 if let Some(paths) = discover_python_paths() {
@@ -859,5 +901,549 @@ fn dirs_candidate(module_file: &str) -> Option<std::path::PathBuf> {
         std::env::var("HOME").ok()
     };
     home.map(|h| Path::new(&h).join(".mps").join("packages").join(module_file))
+}
+
+fn run_lsp() {
+    let stdin = std::io::stdin();
+    let mut reader = stdin.lock();
+    let mut stdout = std::io::stdout();
+
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).is_err() {
+            break;
+        }
+        if line.is_empty() {
+            break;
+        }
+        if line.starts_with("Content-Length:") {
+            let parts: Vec<&str> = line.split(':').collect();
+            if parts.len() < 2 {
+                continue;
+            }
+            let len: usize = parts[1].trim().parse().unwrap_or(0);
+            
+            let mut empty = String::new();
+            let _ = reader.read_line(&mut empty);
+            
+            let mut body = vec![0; len];
+            if reader.read_exact(&mut body).is_ok() {
+                let body_str = String::from_utf8_lossy(&body);
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body_str) {
+                    let method = json["method"].as_str().unwrap_or("");
+                    let id = &json["id"];
+                    
+                    match method {
+                        "initialize" => {
+                            let response = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "capabilities": {
+                                        "textDocumentSync": 1,
+                                        "hoverProvider": true,
+                                        "definitionProvider": true
+                                    }
+                                }
+                            });
+                            send_lsp_response(&mut stdout, response);
+                        }
+                        "textDocument/hover" => {
+                            let params = &json["params"];
+                            let doc_uri = params["textDocument"]["uri"].as_str().unwrap_or("");
+                            let line = params["position"]["line"].as_u64().unwrap_or(0) as usize;
+                            let character = params["position"]["character"].as_u64().unwrap_or(0) as usize;
+                            
+                            let hover_content = get_lsp_hover(doc_uri, line, character);
+                            let response = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": hover_content
+                            });
+                            send_lsp_response(&mut stdout, response);
+                        }
+                        "textDocument/definition" => {
+                            let params = &json["params"];
+                            let doc_uri = params["textDocument"]["uri"].as_str().unwrap_or("");
+                            let line = params["position"]["line"].as_u64().unwrap_or(0) as usize;
+                            let character = params["position"]["character"].as_u64().unwrap_or(0) as usize;
+                            
+                            let def_loc = get_lsp_definition(doc_uri, line, character);
+                            let response = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": def_loc
+                            });
+                            send_lsp_response(&mut stdout, response);
+                        }
+                        _ => {
+                            if !id.is_null() {
+                                let response = serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "result": serde_json::Value::Null
+                                });
+                                send_lsp_response(&mut stdout, response);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn send_lsp_response(stdout: &mut std::io::Stdout, response: serde_json::Value) {
+    if let Ok(resp_str) = serde_json::to_string(&response) {
+        let mut stdout_lock = stdout.lock();
+        let _ = write!(stdout_lock, "Content-Length: {}\r\n\r\n{}", resp_str.len(), resp_str);
+        let _ = stdout_lock.flush();
+    }
+}
+
+fn token_len(st: &lexer::SpannedToken) -> usize {
+    match &st.token {
+        lexer::Token::Identifier(s) => s.len(),
+        lexer::Token::IntLiteral(n) => n.to_string().len(),
+        lexer::Token::FloatLiteral(f) => f.to_string().len(),
+        lexer::Token::StringLiteral(s) => s.len() + 2,
+        lexer::Token::FStringText(s) => s.len(),
+        _ => 2,
+    }
+}
+
+fn get_lsp_definition(uri: &str, line: usize, character: usize) -> serde_json::Value {
+    let file_path = if uri.starts_with("file:///") {
+        PathBuf::from(uri.trim_start_matches("file:///"))
+    } else if uri.starts_with("file://") {
+        PathBuf::from(uri.trim_start_matches("file://"))
+    } else {
+        PathBuf::from(uri)
+    };
+
+    let source = match fs::read_to_string(&file_path) {
+        Ok(s) => s,
+        Err(_) => return serde_json::Value::Null,
+    };
+
+    let mut lex = lexer::Lexer::new(&source);
+    let tokens = match lex.tokenize_all() {
+        Ok(t) => t,
+        Err(_) => return serde_json::Value::Null,
+    };
+
+    let target_token = tokens.iter().find(|t| {
+        t.line == line + 1 &&
+        character + 1 >= t.col &&
+        character + 1 < t.col + token_len(t)
+    });
+
+    let target_name = match target_token {
+        Some(lexer::SpannedToken { token: lexer::Token::Identifier(name), .. }) => name,
+        _ => return serde_json::Value::Null,
+    };
+
+    for i in 0..tokens.len() {
+        let tok = &tokens[i];
+        if let lexer::Token::Identifier(ref name) = tok.token {
+            if name == target_name {
+                let mut is_decl = false;
+                if i > 0 {
+                    match &tokens[i - 1].token {
+                        lexer::Token::Fn | lexer::Token::Class | lexer::Token::Trait | lexer::Token::Let | lexer::Token::Const => {
+                            is_decl = true;
+                        }
+                        _ => {}
+                    }
+                }
+                if i > 1 && !is_decl {
+                    if let (lexer::Token::Fn, lexer::Token::Async) = (&tokens[i - 1].token, &tokens[i - 2].token) {
+                        is_decl = true;
+                    }
+                }
+                
+                if is_decl {
+                    return serde_json::json!({
+                        "uri": uri,
+                        "range": {
+                            "start": { "line": tok.line - 1, "character": tok.col - 1 },
+                            "end": { "line": tok.line - 1, "character": tok.col - 1 + target_name.len() }
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    serde_json::Value::Null
+}
+
+fn get_lsp_hover(uri: &str, line: usize, character: usize) -> serde_json::Value {
+    let file_path = if uri.starts_with("file:///") {
+        PathBuf::from(uri.trim_start_matches("file:///"))
+    } else if uri.starts_with("file://") {
+        PathBuf::from(uri.trim_start_matches("file://"))
+    } else {
+        PathBuf::from(uri)
+    };
+
+    let source = match fs::read_to_string(&file_path) {
+        Ok(s) => s,
+        Err(_) => return serde_json::Value::Null,
+    };
+
+    let mut lex = lexer::Lexer::new(&source);
+    let tokens = match lex.tokenize_all() {
+        Ok(t) => t,
+        Err(_) => return serde_json::Value::Null,
+    };
+
+    let target_token = tokens.iter().find(|t| {
+        t.line == line + 1 &&
+        character + 1 >= t.col &&
+        character + 1 < t.col + token_len(t)
+    });
+
+    let target_name = match target_token {
+        Some(lexer::SpannedToken { token: lexer::Token::Identifier(name), .. }) => name,
+        _ => return serde_json::Value::Null,
+    };
+
+    for i in 0..tokens.len() {
+        let tok = &tokens[i];
+        if let lexer::Token::Identifier(ref name) = tok.token {
+            if name == target_name {
+                let mut is_decl = false;
+                if i > 0 {
+                    match &tokens[i - 1].token {
+                        lexer::Token::Fn | lexer::Token::Class | lexer::Token::Trait | lexer::Token::Let | lexer::Token::Const => {
+                            is_decl = true;
+                        }
+                        _ => {}
+                    }
+                }
+                if i > 1 && !is_decl {
+                    if let (lexer::Token::Fn, lexer::Token::Async) = (&tokens[i - 1].token, &tokens[i - 2].token) {
+                        is_decl = true;
+                    }
+                }
+
+                if is_decl {
+                    let lines: Vec<&str> = source.lines().collect();
+                    if tok.line - 1 < lines.len() {
+                        let raw_line = lines[tok.line - 1].trim();
+                        let decl_str = if raw_line.ends_with(':') {
+                            &raw_line[..raw_line.len() - 1]
+                        } else {
+                            raw_line
+                        };
+                        return serde_json::json!({
+                            "contents": {
+                                "kind": "markdown",
+                                "value": format!("```mps\n{}\n```", decl_str)
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    let builtins = [
+        ("print", "fn print(x: any) -> void"),
+        ("mps_print", "fn mps_print(x: any) -> void"),
+        ("mps_println", "fn mps_println(x: any) -> void"),
+        ("mps_input", "fn mps_input(prompt: string) -> string"),
+        ("mps_to_int", "fn mps_to_int(x: any) -> int"),
+        ("mps_to_float", "fn mps_to_float(x: any) -> float"),
+        ("mps_to_string", "fn mps_to_string(x: any) -> string"),
+        ("mps_to_bool", "fn mps_to_bool(x: any) -> bool"),
+        ("len", "fn len(collection: PyObject) -> int"),
+        ("range", "fn range(start: int, stop: int) -> PyObject"),
+        ("matrix_add", "fn matrix_add(a: Matrix, b: Matrix) -> Matrix"),
+        ("matrix_relu", "fn matrix_relu(a: Matrix) -> Matrix"),
+        ("matrix32_add", "fn matrix32_add(a: Matrix32, b: Matrix32) -> Matrix32"),
+        ("matrix32_relu", "fn matrix32_relu(a: Matrix32) -> Matrix32"),
+        ("mps_random", "fn mps_random() -> float"),
+        ("mps_randint", "fn mps_randint(min: int, max: int) -> int"),
+        ("mps_random_seed", "fn mps_random_seed(seed: int) -> void"),
+    ];
+
+    for (b_name, b_sig) in &builtins {
+        if *b_name == target_name {
+            return serde_json::json!({
+                "contents": {
+                    "kind": "markdown",
+                    "value": format!("```mps\n{}\n```", b_sig)
+                }
+            });
+        }
+    }
+
+    serde_json::Value::Null
+}
+
+fn run_formatter(args: &[String]) {
+    if args.is_empty() {
+        eprintln!("Error: No files specified to format.");
+        std::process::exit(1);
+    }
+    
+    for filename in args {
+        let path = Path::new(filename);
+        if !path.exists() {
+            eprintln!("Error: File '{}' does not exist.", filename);
+            continue;
+        }
+        let source_code = match fs::read_to_string(path) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("Error: Failed to read file '{}': {}", filename, e);
+                continue;
+            }
+        };
+        let mut lex = lexer::Lexer::new(&source_code);
+        let tokens = match lex.tokenize_all() {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("Error in '{}': {}", filename, e);
+                continue;
+            }
+        };
+        let mut parser = parser::Parser::new(tokens);
+        let program = match parser.parse_program() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Error in '{}': {}", filename, e);
+                continue;
+            }
+        };
+        let formatted = format_program(&program);
+        if let Err(e) = fs::write(path, formatted) {
+            eprintln!("Error: Failed to write to file '{}': {}", filename, e);
+        } else {
+            println!("Formatted '{}'", filename);
+        }
+    }
+}
+
+fn format_program(program: &ast::Program) -> String {
+    let mut out = String::new();
+    for stmt in &program.statements {
+        out.push_str(&format_statement(stmt, 0));
+    }
+    out
+}
+
+fn format_statement(stmt: &ast::Stmt, indent: usize) -> String {
+    let ind = "    ".repeat(indent);
+    match stmt {
+        ast::Stmt::FunctionDecl { name, params, return_type, body, is_async, decorators } => {
+            let mut out = String::new();
+            for dec in decorators {
+                out.push_str(&format!("{}@{}\n", ind, dec));
+            }
+            let async_prefix = if *is_async { "async " } else { "" };
+            let param_strs: Vec<String> = params.iter().map(|p| format!("{}: {}", p.name, p.param_type)).collect();
+            out.push_str(&format!("{}fn {}{}({}) -> {}:\n", ind, async_prefix, name, param_strs.join(", "), return_type));
+            for s in body {
+                out.push_str(&format_statement(s, indent + 1));
+            }
+            out
+        }
+        ast::Stmt::ClassDecl { name, base_class, members } => {
+            let mut out = String::new();
+            let parent_suffix = if let Some(parent) = base_class { format!("({})", parent) } else { "".to_string() };
+            out.push_str(&format!("{}class {}{}:\n", ind, name, parent_suffix));
+            if members.is_empty() {
+                out.push_str(&format!("{}    pass\n", ind));
+            } else {
+                for m in members {
+                    out.push_str(&format_statement(m, indent + 1));
+                }
+            }
+            out
+        }
+        ast::Stmt::TraitDecl { name, methods } => {
+            let mut out = String::new();
+            out.push_str(&format!("{}trait {}:\n", ind, name));
+            for m in methods {
+                let param_strs: Vec<String> = m.params.iter().map(|p| format!("{}: {}", p.name, p.param_type)).collect();
+                out.push_str(&format!("{}    fn {}({}) -> {}\n", ind, m.name, param_strs.join(", "), m.return_type));
+            }
+            out
+        }
+        ast::Stmt::PyImport { library, alias } => {
+            let alias_suffix = if let Some(a) = alias { format!(" as {}", a) } else { "".to_string() };
+            format!("{}pyimport {}{}\n", ind, library, alias_suffix)
+        }
+        ast::Stmt::Import { path, alias } => {
+            let alias_suffix = if let Some(a) = alias { format!(" as {}", a) } else { "".to_string() };
+            format!("{}import {}{}\n", ind, path.join("."), alias_suffix)
+        }
+        ast::Stmt::FromImport { path, symbols } => {
+            format!("{}from {} import {}\n", ind, path.join("."), symbols.join(", "))
+        }
+        ast::Stmt::VariableDecl { name, is_const, var_type, init } => {
+            let keyword = if *is_const { "const" } else { "let" };
+            let type_str = if let Some(t) = var_type { format!(": {}", t) } else { "".to_string() };
+            let init_str = if let Some(expr) = init { format!(" = {}", format_expression(expr)) } else { "".to_string() };
+            format!("{}{} {}{}{}\n", ind, keyword, name, type_str, init_str)
+        }
+        ast::Stmt::AssignStmt { lhs, value } => {
+            format!("{}{} = {}\n", ind, format_expression(lhs), format_expression(value))
+        }
+        ast::Stmt::IfStmt { condition, then_branch, else_branch } => {
+            let mut out = format!("{}if {}:\n", ind, format_expression(condition));
+            for s in then_branch {
+                out.push_str(&format_statement(s, indent + 1));
+            }
+            if let Some(eb) = else_branch {
+                out.push_str(&format!("{}else:\n", ind));
+                for s in eb {
+                    out.push_str(&format_statement(s, indent + 1));
+                }
+            }
+            out
+        }
+        ast::Stmt::WhileStmt { condition, body } => {
+            let mut out = format!("{}while {}:\n", ind, format_expression(condition));
+            for s in body {
+                out.push_str(&format_statement(s, indent + 1));
+            }
+            out
+        }
+        ast::Stmt::ForStmt { var_name, iterable, body } => {
+            let mut out = format!("{}for {} in {}:\n", ind, var_name, format_expression(iterable));
+            for s in body {
+                out.push_str(&format_statement(s, indent + 1));
+            }
+            out
+        }
+        ast::Stmt::TryCatchStmt { try_branch, catch_var, catch_branch, finally_branch } => {
+            let mut out = format!("{}try:\n", ind);
+            for s in try_branch {
+                out.push_str(&format_statement(s, indent + 1));
+            }
+            out.push_str(&format!("{}catch {}:\n", ind, catch_var));
+            for s in catch_branch {
+                out.push_str(&format_statement(s, indent + 1));
+            }
+            if let Some(fb) = finally_branch {
+                out.push_str(&format!("{}finally:\n", ind));
+                for s in fb {
+                    out.push_str(&format_statement(s, indent + 1));
+                }
+            }
+            out
+        }
+        ast::Stmt::RaiseStmt(expr) => {
+            format!("{}raise {}\n", ind, format_expression(expr))
+        }
+        ast::Stmt::MatchStmt { value, cases } => {
+            let mut out = format!("{}match {}:\n", ind, format_expression(value));
+            for case in cases {
+                let pat_str = match &case.pattern {
+                    ast::MatchPattern::Literal(lit) => format_literal(lit),
+                    ast::MatchPattern::Wildcard => "_".to_string(),
+                };
+                out.push_str(&format!("{}    case {}:\n", ind, pat_str));
+                for s in &case.body {
+                    out.push_str(&format_statement(s, indent + 2));
+                }
+            }
+            out
+        }
+        ast::Stmt::TupleUnpack { vars, init } => {
+            format!("{}let {} = {}\n", ind, vars.join(", "), format_expression(init))
+        }
+        ast::Stmt::ExprStmt(expr) => {
+            format!("{}{}\n", ind, format_expression(expr))
+        }
+        ast::Stmt::ReturnStmt(opt_expr) => {
+            if let Some(expr) = opt_expr {
+                format!("{}return {}\n", ind, format_expression(expr))
+            } else {
+                format!("{}return\n", ind)
+            }
+        }
+        ast::Stmt::BreakStmt => format!("{}break\n", ind),
+        ast::Stmt::ContinueStmt => format!("{}continue\n", ind),
+    }
+}
+
+fn format_expression(expr: &ast::Expr) -> String {
+    match expr {
+        ast::Expr::Literal(lit) => format_literal(lit),
+        ast::Expr::Identifier(name) => name.clone(),
+        ast::Expr::Unary { op, operand } => format!("{}{}", op, format_expression(operand)),
+        ast::Expr::Binary { op, left, right } => format!("({} {} {})", format_expression(left), op, format_expression(right)),
+        ast::Expr::Call { name, args } => {
+            let arg_strs: Vec<String> = args.iter().map(format_expression).collect();
+            format!("{}({})", name, arg_strs.join(", "))
+        }
+        ast::Expr::MemberAccess { object, member } => format!("{}.{}", format_expression(object), member),
+        ast::Expr::MemberCall { object, method, args } => {
+            let arg_strs: Vec<String> = args.iter().map(format_expression).collect();
+            format!("{}.{}({})", format_expression(object), method, arg_strs.join(", "))
+        }
+        ast::Expr::OptionalMemberAccess { object, member } => format!("{}.?{}", format_expression(object), member),
+        ast::Expr::OptionalMemberCall { object, method, args } => {
+            let arg_strs: Vec<String> = args.iter().map(format_expression).collect();
+            format!("{}.?{}({})", format_expression(object), method, arg_strs.join(", "))
+        }
+        ast::Expr::Subscript { object, index } => format!("{}[{}]", format_expression(object), format_expression(index)),
+        ast::Expr::ListLiteral(exprs) => {
+            let item_strs: Vec<String> = exprs.iter().map(format_expression).collect();
+            format!("[{}]", item_strs.join(", "))
+        }
+        ast::Expr::DictLiteral(pairs) => {
+            let pair_strs: Vec<String> = pairs.iter().map(|(k, v)| format!("{}: {}", format_expression(k), format_expression(v))).collect();
+            format!("{{{}}}", pair_strs.join(", "))
+        }
+        ast::Expr::TupleLiteral(exprs) => {
+            let item_strs: Vec<String> = exprs.iter().map(format_expression).collect();
+            format!("({})", item_strs.join(", "))
+        }
+        ast::Expr::SuperCall { method, args } => {
+            let arg_strs: Vec<String> = args.iter().map(format_expression).collect();
+            format!("super.{}({})", method, arg_strs.join(", "))
+        }
+        ast::Expr::Lambda { params, return_type, body } => {
+            let param_strs: Vec<String> = params.iter().map(|p| format!("{}: {}", p.name, p.param_type)).collect();
+            format!("lambda {}: {} -> {}", param_strs.join(", "), return_type, format_expression(body))
+        }
+        ast::Expr::AwaitExpr(expr) => format!("await {}", format_expression(expr)),
+        ast::Expr::FString { parts } => {
+            let mut out = "f\"".to_string();
+            for part in parts {
+                match part {
+                    ast::FStringPart::Text(t) => out.push_str(t),
+                    ast::FStringPart::Expr(e) => out.push_str(&format!("{{{}}}", format_expression(e))),
+                }
+            }
+            out.push('"');
+            out
+        }
+        ast::Expr::Super => "super".to_string(),
+        ast::Expr::Slice { object, start, end } => {
+            let start_str = start.as_ref().map(|s| format_expression(s)).unwrap_or_default();
+            let end_str = end.as_ref().map(|e| format_expression(e)).unwrap_or_default();
+            format!("{}[{}:{}]", format_expression(object), start_str, end_str)
+        }
+        ast::Expr::ListComprehension { element, var_name, iterable } => {
+            format!("[{} for {} in {}]", format_expression(element), var_name, format_expression(iterable))
+        }
+    }
+}
+
+fn format_literal(lit: &ast::Literal) -> String {
+    match lit {
+        ast::Literal::Int(n) => n.to_string(),
+        ast::Literal::Float(f) => f.to_string(),
+        ast::Literal::String(s) => format!("\"{}\"", s),
+        ast::Literal::Bool(b) => b.to_string(),
+        ast::Literal::Null => "null".to_string(),
+    }
 }
 

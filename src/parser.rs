@@ -91,6 +91,33 @@ impl Parser {
             self.advance();
         }
 
+        let mut decorators = Vec::new();
+        while self.peek() == Some(&Token::At) {
+            self.advance(); // consume '@'
+            let dec_name = match self.advance() {
+                Some(Token::Identifier(s)) => s,
+                Some(tok) => return self.error(&format!("Expected decorator name, found {:?}", tok)),
+                None => return self.error("Expected decorator name, found EOF"),
+            };
+            decorators.push(dec_name);
+            self.consume_statement_end()?;
+        }
+
+        if !decorators.is_empty() {
+            match self.peek() {
+                Some(Token::Fn) => {
+                    self.advance(); // consume 'fn'
+                    return self.parse_function_decl_body(false, decorators);
+                }
+                Some(Token::Async) => {
+                    self.advance(); // consume 'async'
+                    self.consume(Token::Fn, "Expected 'fn' keyword after 'async'")?;
+                    return self.parse_function_decl_body(true, decorators);
+                }
+                _ => return self.error("Expected function declaration after decorator"),
+            }
+        }
+
         match self.peek() {
             Some(Token::Fn) => self.parse_function_decl(),
             Some(Token::Async) => {
@@ -123,14 +150,29 @@ impl Parser {
             }
             _ => {
                 let expr = self.parse_expression()?;
-                if self.peek() == Some(&Token::Assign) {
-                    self.advance(); // consume '='
-                    let value = self.parse_expression()?;
+                let is_compound = match self.peek() {
+                    Some(Token::Assign) => Some(None),
+                    Some(Token::PlusEq) => Some(Some(BinOp::Add)),
+                    Some(Token::MinusEq) => Some(Some(BinOp::Sub)),
+                    Some(Token::StarEq) => Some(Some(BinOp::Mul)),
+                    _ => None,
+                };
+
+                if let Some(op_opt) = is_compound {
+                    self.advance(); // consume the operator token
+                    let mut value = self.parse_expression()?;
                     self.consume_statement_end()?;
 
                     // Validate LHS is identifier, member access, or subscript expression
                     match &expr {
                         Expr::Identifier(_) | Expr::MemberAccess { .. } | Expr::Subscript { .. } => {
+                            if let Some(op) = op_opt {
+                                value = Expr::Binary {
+                                    op,
+                                    left: Box::new(expr.clone()),
+                                    right: Box::new(value),
+                                };
+                            }
                             Ok(Stmt::AssignStmt { lhs: expr, value })
                         }
                         _ => self.error("Invalid left-hand side of assignment expression")
@@ -345,15 +387,15 @@ impl Parser {
 
     fn parse_function_decl(&mut self) -> Result<Stmt, String> {
         self.consume(Token::Fn, "Expected 'fn' keyword")?;
-        self.parse_function_decl_body(false)
+        self.parse_function_decl_body(false, Vec::new())
     }
 
     fn parse_async_function_decl(&mut self) -> Result<Stmt, String> {
         self.consume(Token::Fn, "Expected 'fn' keyword after 'async'")?;
-        self.parse_function_decl_body(true)
+        self.parse_function_decl_body(true, Vec::new())
     }
 
-    fn parse_function_decl_body(&mut self, is_async: bool) -> Result<Stmt, String> {
+    fn parse_function_decl_body(&mut self, is_async: bool, decorators: Vec<String>) -> Result<Stmt, String> {
         let name = match self.advance() {
             Some(Token::Identifier(s)) => s,
             Some(tok) => return self.error(&format!("Expected function name, found {:?}", tok)),
@@ -388,6 +430,7 @@ impl Parser {
             return_type,
             body,
             is_async,
+            decorators,
         })
     }
 
@@ -437,6 +480,7 @@ impl Parser {
                 match self.advance() {
                     Some(Token::IntType) => Ok(Type::Int),
                     Some(Token::FloatType) => Ok(Type::Float),
+                    Some(Token::Float32Type) => Ok(Type::Float32),
                     Some(Token::StringType) => Ok(Type::String),
                     Some(Token::BoolType) => Ok(Type::Bool),
                     Some(Token::VoidType) => Ok(Type::Void),
@@ -452,12 +496,33 @@ impl Parser {
         let expected_kw = if is_const { Token::Const } else { Token::Let };
         self.consume(expected_kw, "Expected variable declaration keyword")?;
 
-        let name = match self.advance() {
-            Some(Token::Identifier(s)) => s,
+        let mut names = Vec::new();
+        match self.advance() {
+            Some(Token::Identifier(s)) => names.push(s),
             Some(tok) => return self.error(&format!("Expected variable name, found {:?}", tok)),
             None => return self.error("Expected variable name, found EOF"),
-        };
+        }
 
+        while self.peek() == Some(&Token::Comma) {
+            self.advance(); // consume ','
+            match self.advance() {
+                Some(Token::Identifier(s)) => names.push(s),
+                Some(tok) => return self.error(&format!("Expected variable name after comma, found {:?}", tok)),
+                None => return self.error("Expected variable name after comma, found EOF"),
+            }
+        }
+
+        if names.len() > 1 {
+            if is_const {
+                return self.error("Tuple unpacking cannot be used with 'const'. Use 'let' instead.");
+            }
+            self.consume(Token::Assign, "Expected '=' in tuple unpacking")?;
+            let init = self.parse_expression()?;
+            self.consume_statement_end()?;
+            return Ok(Stmt::TupleUnpack { vars: names, init });
+        }
+
+        let name = names.remove(0);
         let mut var_type = None;
         if self.peek() == Some(&Token::Colon) {
             self.advance(); // consume ':'
@@ -705,7 +770,35 @@ impl Parser {
     }
 
     fn parse_expression(&mut self) -> Result<Expr, String> {
-        self.parse_pipe()
+        self.parse_logical_or()
+    }
+
+    fn parse_logical_or(&mut self) -> Result<Expr, String> {
+        let mut left = self.parse_logical_and()?;
+        while self.peek() == Some(&Token::Or) {
+            self.advance();
+            let right = self.parse_logical_and()?;
+            left = Expr::Binary {
+                op: BinOp::Or,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    fn parse_logical_and(&mut self) -> Result<Expr, String> {
+        let mut left = self.parse_pipe()?;
+        while self.peek() == Some(&Token::And) {
+            self.advance();
+            let right = self.parse_pipe()?;
+            left = Expr::Binary {
+                op: BinOp::And,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
     }
 
     fn parse_pipe(&mut self) -> Result<Expr, String> {
@@ -787,10 +880,10 @@ impl Parser {
     }
 
     fn parse_multiplicative(&mut self) -> Result<Expr, String> {
-        let mut left = self.parse_unary()?;
+        let mut left = self.parse_power()?;
         while let Some(op) = self.peek_binop_multiplicative() {
             self.advance();
-            let right = self.parse_unary()?;
+            let right = self.parse_power()?;
             left = Expr::Binary {
                 op,
                 left: Box::new(left),
@@ -798,6 +891,21 @@ impl Parser {
             };
         }
         Ok(left)
+    }
+
+    fn parse_power(&mut self) -> Result<Expr, String> {
+        let left = self.parse_unary()?;
+        if self.peek() == Some(&Token::Pow) {
+            self.advance();
+            let right = self.parse_unary()?;
+            Ok(Expr::Binary {
+                op: BinOp::Pow,
+                left: Box::new(left),
+                right: Box::new(right),
+            })
+        } else {
+            Ok(left)
+        }
     }
 
     fn parse_unary(&mut self) -> Result<Expr, String> {
@@ -884,12 +992,42 @@ impl Parser {
                 }
                 Some(Token::OpenBracket) => {
                     self.advance(); // consume '['
-                    let index = self.parse_expression()?;
-                    self.consume(Token::CloseBracket, "Expected ']' after subscript index")?;
-                    expr = Expr::Subscript {
-                        object: Box::new(expr),
-                        index: Box::new(index),
-                    };
+                    if self.peek() == Some(&Token::Colon) {
+                        self.advance(); // consume ':'
+                        let end = if self.peek() != Some(&Token::CloseBracket) {
+                            Some(Box::new(self.parse_expression()?))
+                        } else {
+                            None
+                        };
+                        self.consume(Token::CloseBracket, "Expected ']' after slice")?;
+                        expr = Expr::Slice {
+                            object: Box::new(expr),
+                            start: None,
+                            end,
+                        };
+                    } else {
+                        let first = self.parse_expression()?;
+                        if self.peek() == Some(&Token::Colon) {
+                            self.advance(); // consume ':'
+                            let end = if self.peek() != Some(&Token::CloseBracket) {
+                                Some(Box::new(self.parse_expression()?))
+                            } else {
+                                None
+                            };
+                            self.consume(Token::CloseBracket, "Expected ']' after slice")?;
+                            expr = Expr::Slice {
+                                object: Box::new(expr),
+                                start: Some(Box::new(first)),
+                                end,
+                            };
+                        } else {
+                            self.consume(Token::CloseBracket, "Expected ']' after subscript index")?;
+                            expr = Expr::Subscript {
+                                object: Box::new(expr),
+                                index: Box::new(first),
+                            };
+                        }
+                    }
                 }
                 _ => break,
             }
@@ -965,9 +1103,28 @@ impl Parser {
             }
             Some(Token::OpenBracket) => {
                 self.advance(); // consume '['
-                let mut elements = Vec::new();
-                if self.peek() != Some(&Token::CloseBracket) {
-                    elements.push(self.parse_expression()?);
+                if self.peek() == Some(&Token::CloseBracket) {
+                    self.advance();
+                    return Ok(Expr::ListLiteral(Vec::new()));
+                }
+                let first = self.parse_expression()?;
+                if self.peek() == Some(&Token::For) {
+                    self.advance(); // consume 'for'
+                    let var_name = match self.advance() {
+                        Some(Token::Identifier(s)) => s,
+                        Some(tok) => return self.error(&format!("Expected loop variable name in list comprehension, found {:?}", tok)),
+                        None => return self.error("Expected loop variable name in list comprehension, found EOF"),
+                    };
+                    self.consume(Token::In, "Expected 'in' keyword in list comprehension")?;
+                    let iterable = self.parse_expression()?;
+                    self.consume(Token::CloseBracket, "Expected ']' at end of list comprehension")?;
+                    Ok(Expr::ListComprehension {
+                        element: Box::new(first),
+                        var_name,
+                        iterable: Box::new(iterable),
+                    })
+                } else {
+                    let mut elements = vec![first];
                     while self.peek() == Some(&Token::Comma) {
                         self.advance(); // consume ','
                         if self.peek() == Some(&Token::CloseBracket) {
@@ -975,9 +1132,9 @@ impl Parser {
                         }
                         elements.push(self.parse_expression()?);
                     }
+                    self.consume(Token::CloseBracket, "Expected ']' at end of list literal")?;
+                    Ok(Expr::ListLiteral(elements))
                 }
-                self.consume(Token::CloseBracket, "Expected ']' at end of list literal")?;
-                Ok(Expr::ListLiteral(elements))
             }
             Some(Token::OpenBrace) => {
                 self.advance(); // consume '{'
@@ -1146,6 +1303,30 @@ mod tests {
                 assert!(matches!(**index, Expr::Identifier(ref n) if n == "j"));
             } else {
                 panic!("Expected nested Subscript expression");
+            }
+        } else {
+            panic!("Expected VariableDecl statement");
+        }
+    }
+
+    #[test]
+    fn test_parse_logical_and_power() {
+        let mut lex = Lexer::new("let ok = a > 0 and b ** 2 > 4 or c\n");
+        let tokens = lex.tokenize_all().unwrap();
+        let mut parser = Parser::new(tokens);
+        let prog = parser.parse_program().unwrap();
+
+        assert_eq!(prog.statements.len(), 1);
+        if let Stmt::VariableDecl { init, .. } = &prog.statements[0] {
+            if let Expr::Binary { op: BinOp::Or, left, right } = init.as_ref().unwrap() {
+                assert!(matches!(**right, Expr::Identifier(ref name) if name == "c"));
+                if let Expr::Binary { op: BinOp::And, .. } = &**left {
+                    // ok
+                } else {
+                    panic!("Expected nested And expression");
+                }
+            } else {
+                panic!("Expected top-level Or expression");
             }
         } else {
             panic!("Expected VariableDecl statement");
@@ -1481,5 +1662,49 @@ mod tests {
         assert!(c_code.contains("py_call"), "Should transpile collection methods to py_call. Code: {}", c_code);
         assert!(c_code.contains("mps_to_int"), "Should transpile length() with mps_to_int wrapper. Code: {}", c_code);
         assert!(c_code.contains("mps_to_bool"), "Should transpile contains() with mps_to_bool wrapper. Code: {}", c_code);
+    }
+
+    #[test]
+    fn test_extensions_parser() {
+        // Test compound assignment, slicing, list comprehensions, tuple unpacking, decorators, float32
+        let code = "@jit\nfn f(x: float32) -> float32:\n    let a, b = g()\n    a += 1\n    let slice = data[1:10]\n    let comp = [y * 2 for y in range(0, 10)]\n    return x";
+        let mut lex = Lexer::new(code);
+        let tokens = lex.tokenize_all().unwrap();
+        let mut parser = Parser::new(tokens);
+        let prog = parser.parse_program().unwrap();
+
+        assert_eq!(prog.statements.len(), 1);
+        if let Stmt::FunctionDecl { decorators, params, return_type, body, .. } = &prog.statements[0] {
+            assert_eq!(decorators.len(), 1);
+            assert_eq!(decorators[0], "jit");
+            assert_eq!(params[0].param_type, Type::Float32);
+            assert_eq!(*return_type, Type::Float32);
+            
+            // let a, b = g()
+            assert!(matches!(body[0], Stmt::TupleUnpack { .. }));
+            
+            // a += 1 (should be lowered to standard AssignStmt with Binary Add)
+            if let Stmt::AssignStmt { value, .. } = &body[1] {
+                assert!(matches!(value, Expr::Binary { op: BinOp::Add, .. }));
+            } else {
+                panic!("Expected AssignStmt");
+            }
+            
+            // let slice = data[1:10]
+            if let Stmt::VariableDecl { init, .. } = &body[2] {
+                assert!(matches!(init.as_ref().unwrap(), Expr::Slice { .. }));
+            } else {
+                panic!("Expected VariableDecl with Slice");
+            }
+
+            // let comp = [y * 2 for y in range(0, 10)]
+            if let Stmt::VariableDecl { init, .. } = &body[3] {
+                assert!(matches!(init.as_ref().unwrap(), Expr::ListComprehension { .. }));
+            } else {
+                panic!("Expected VariableDecl with ListComprehension");
+            }
+        } else {
+            panic!("Expected FunctionDecl");
+        }
     }
 }

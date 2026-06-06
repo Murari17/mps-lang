@@ -34,6 +34,8 @@ pub enum Token {
     Continue,
     Null,
     Optional,
+    And,
+    Or,
     Import,
     From,
 
@@ -41,6 +43,7 @@ pub enum Token {
     // Primitive types
     IntType,
     FloatType,
+    Float32Type,
     StringType,
     BoolType,
     VoidType,
@@ -63,11 +66,16 @@ pub enum Token {
 
     // Symbols & Operators
     Plus,
+    PlusEq,
     Minus,
+    MinusEq,
     Star,
+    StarEq,
+    Pow,
     Slash,
     Percent,
     Assign,
+    At,
     Eq,
     Ne,
     Lt,
@@ -126,10 +134,13 @@ impl std::fmt::Display for Token {
             Token::Continue => write!(f, "continue"),
             Token::Null => write!(f, "null"),
             Token::Optional => write!(f, "optional"),
+            Token::And => write!(f, "and"),
+            Token::Or => write!(f, "or"),
             Token::Import => write!(f, "import"),
             Token::From => write!(f, "from"),
             Token::IntType => write!(f, "int"),
             Token::FloatType => write!(f, "float"),
+            Token::Float32Type => write!(f, "float32"),
             Token::StringType => write!(f, "string"),
             Token::BoolType => write!(f, "bool"),
             Token::VoidType => write!(f, "void"),
@@ -138,11 +149,16 @@ impl std::fmt::Display for Token {
             Token::FloatLiteral(n) => write!(f, "{}", n),
             Token::StringLiteral(s) => write!(f, "\"{}\"", s),
             Token::Plus => write!(f, "+"),
+            Token::PlusEq => write!(f, "+="),
             Token::Minus => write!(f, "-"),
+            Token::MinusEq => write!(f, "-="),
             Token::Star => write!(f, "*"),
+            Token::StarEq => write!(f, "*="),
             Token::Slash => write!(f, "/"),
             Token::Percent => write!(f, "%"),
+            Token::Pow => write!(f, "**"),
             Token::Assign => write!(f, "="),
+            Token::At => write!(f, "@"),
             Token::Eq => write!(f, "=="),
             Token::Ne => write!(f, "!="),
             Token::Lt => write!(f, "<"),
@@ -316,8 +332,17 @@ impl Lexer {
                 // Look ahead for blank/comment lines
                 self.skip_whitespace_on_line();
                 let next_ch = self.peek();
-                if next_ch.is_none() || next_ch == Some('\r') || next_ch == Some('\n') || next_ch == Some('#') {
+                if next_ch.is_none() || next_ch == Some('\r') || next_ch == Some('\n') || next_ch == Some('#') || (next_ch == Some('/') && self.peek_next() == Some('/')) {
                     if let Some('#') = self.peek() {
+                        while let Some(ch) = self.peek() {
+                            if ch == '\n' || ch == '\r' {
+                                break;
+                            }
+                            self.advance();
+                        }
+                    } else if next_ch == Some('/') && self.peek_next() == Some('/') {
+                        self.advance();
+                        self.advance();
                         while let Some(ch) = self.peek() {
                             if ch == '\n' || ch == '\r' {
                                 break;
@@ -369,7 +394,7 @@ impl Lexer {
 
             let ch = self.peek().unwrap();
 
-            if ch == '#' {
+            if ch == '#' || (ch == '/' && self.peek_next() == Some('/')) {
                 while let Some(c) = self.peek() {
                     if c == '\n' || c == '\r' {
                         break;
@@ -513,10 +538,13 @@ impl Lexer {
                     "continue" => Token::Continue,
                     "null" => Token::Null,
                     "optional" => Token::Optional,
+                    "and" => Token::And,
+                    "or" => Token::Or,
                     "import" => Token::Import,
                     "from" => Token::From,
                     "int" => Token::IntType,
                     "float" => Token::FloatType,
+                    "float32" => Token::Float32Type,
                     "string" => Token::StringType,
                     "bool" => Token::BoolType,
                     "void" => Token::VoidType,
@@ -532,18 +560,39 @@ impl Lexer {
             self.advance();
 
             let tok = match ch {
-                '+' => Token::Plus,
+                '+' => {
+                    if self.peek() == Some('=') {
+                        self.advance();
+                        Token::PlusEq
+                    } else {
+                        Token::Plus
+                    }
+                }
                 '-' => {
                     if self.peek() == Some('>') {
                         self.advance();
                         Token::Arrow
+                    } else if self.peek() == Some('=') {
+                        self.advance();
+                        Token::MinusEq
                     } else {
                         Token::Minus
                     }
                 }
-                '*' => Token::Star,
+                '*' => {
+                    if self.peek() == Some('*') {
+                        self.advance();
+                        Token::Pow
+                    } else if self.peek() == Some('=') {
+                        self.advance();
+                        Token::StarEq
+                    } else {
+                        Token::Star
+                    }
+                },
                 '/' => Token::Slash,
                 '%' => Token::Percent,
+                '@' => Token::At,
                 '=' => {
                     if self.peek() == Some('=') {
                         self.advance();

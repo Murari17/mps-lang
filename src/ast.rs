@@ -2,6 +2,7 @@
 pub enum Type {
     Int,
     Float,
+    Float32,
     String,
     Bool,
     Void,
@@ -19,6 +20,7 @@ impl std::fmt::Display for Type {
         match self {
             Type::Int => write!(f, "int"),
             Type::Float => write!(f, "float"),
+            Type::Float32 => write!(f, "float32"),
             Type::String => write!(f, "string"),
             Type::Bool => write!(f, "bool"),
             Type::Void => write!(f, "void"),
@@ -65,6 +67,9 @@ pub enum BinOp {
     Mul,
     Div,
     Percent,
+    Pow,
+    And,
+    Or,
     Eq,
     Ne,
     Lt,
@@ -81,6 +86,9 @@ impl std::fmt::Display for BinOp {
             BinOp::Mul => "*",
             BinOp::Div => "/",
             BinOp::Percent => "%",
+            BinOp::Pow => "**",
+            BinOp::And => "and",
+            BinOp::Or => "or",
             BinOp::Eq => "==",
             BinOp::Ne => "!=",
             BinOp::Lt => "<",
@@ -156,6 +164,16 @@ pub enum Expr {
         parts: Vec<FStringPart>,
     },
     Super,
+    Slice {
+        object: Box<Expr>,
+        start: Option<Box<Expr>>,
+        end: Option<Box<Expr>>,
+    },
+    ListComprehension {
+        element: Box<Expr>,
+        var_name: String,
+        iterable: Box<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -191,6 +209,7 @@ pub enum Stmt {
         return_type: Type,
         body: Vec<Stmt>,
         is_async: bool,
+        decorators: Vec<String>,
     },
     ClassDecl {
         name: String,
@@ -247,6 +266,10 @@ pub enum Stmt {
     MatchStmt {
         value: Expr,
         cases: Vec<MatchCase>,
+    },
+    TupleUnpack {
+        vars: Vec<String>,
+        init: Expr,
     },
     ExprStmt(Expr),
     ReturnStmt(Option<Expr>),

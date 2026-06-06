@@ -8,6 +8,8 @@
 #include <math.h>
 #include <string.h>
 #include <setjmp.h>
+#include <stdint.h>
+#include <time.h>
 
 #ifdef MPS_USE_PYTHON
 #include <Python.h>
@@ -22,6 +24,7 @@ typedef enum {
     OBJ_TUPLE,
     OBJ_DICT,
     OBJ_ITER,
+    OBJ_SLICE,
     OBJ_NULL
 } ObjType;
 
@@ -49,6 +52,12 @@ typedef struct {
     int index;
 } MPS_IterImpl;
 
+typedef struct {
+    PyObject* start;
+    PyObject* stop;
+    PyObject* step;
+} MPS_SliceImpl;
+
 struct PyObject {
     ObjType type;
     int ref_count;
@@ -60,8 +69,12 @@ struct PyObject {
         MPS_ListImpl* list_val;
         MPS_DictImpl* dict_val;
         MPS_IterImpl* iter_val;
+        MPS_SliceImpl* slice_val;
     } value;
 };
+extern PyObject* _mps_py_none_ref;
+#define Py_None _mps_py_none_ref
+
 static inline const char* mps_str_get_char(const char* s, int index);
 static inline const char* mps_str_upper(const char* s);
 static inline const char* mps_str_lower(const char* s);
@@ -72,7 +85,10 @@ static inline bool mps_str_contains(const char* s, const char* sub);
 static inline const char* mps_str_replace(const char* s, const char* old_str, const char* new_str);
 static inline PyObject* mps_str_split(const char* s, const char* sep);
 static inline const char* mps_str_join(const char* connector, PyObject* list);
+static inline PyObject* PySlice_New(PyObject* start, PyObject* stop, PyObject* step);
+static inline PyObject* PySequence_GetItem(PyObject* o, int i);
 #endif
+static inline const char* mps_str_slice(const char* s, int start, int end);
 
 #ifdef _WIN32
 #include <windows.h>
@@ -113,6 +129,10 @@ THREAD_LOCAL jmp_buf* mps_err_buf = NULL;
 THREAD_LOCAL MPS_Error mps_last_error = { "", 0 };
 THREAD_LOCAL MPS_StackFrame mps_call_stack[MPS_MAX_STACK_DEPTH];
 THREAD_LOCAL int mps_stack_depth = 0;
+#ifndef MPS_USE_PYTHON
+PyObject _mps_py_none_val = { OBJ_NULL, 1, {0} };
+PyObject* _mps_py_none_ref = &_mps_py_none_val;
+#endif
 #endif
 
 static inline void mps_push_frame(const char* func, const char* file, int line) {
@@ -159,25 +179,52 @@ static inline void mps_raise(const char* message) {
     }
 }
 
-/* --- Native Fixed-Size Windows Thread Pool for Async/Await --- */
+/* --- Native Fixed-Size Thread Pool for Async/Await --- */
+#define MPS_MAX_POOL_THREADS 64
+
 typedef struct MPS_Task {
     void (*fn)(void*);
     void* arg;
     bool completed;
+#ifdef _WIN32
     CONDITION_VARIABLE cv;
     CRITICAL_SECTION cs;
+#else
+    pthread_cond_t cv;
+    pthread_mutex_t cs;
+#endif
     struct MPS_Task* next;
 } MPS_Task;
 
 #ifdef MPS_RUNTIME_IMPL
 static MPS_Task* queue_head = NULL;
 static MPS_Task* queue_tail = NULL;
-static CRITICAL_SECTION pool_cs;
-static CONDITION_VARIABLE pool_cv;
 static bool pool_shutdown = false;
-static HANDLE pool_threads[4];
 static int pool_thread_count = 4;
 static bool pool_initialized = false;
+
+static inline int mps_pool_requested_thread_count(void) {
+    const char* env = getenv("MPS_POOL_THREADS");
+    if (env == NULL || env[0] == '\0') {
+        env = getenv("MPS_THREADS");
+    }
+    if (env == NULL || env[0] == '\0') {
+        return pool_thread_count;
+    }
+    int parsed = atoi(env);
+    if (parsed < 1) {
+        return 1;
+    }
+    if (parsed > MPS_MAX_POOL_THREADS) {
+        return MPS_MAX_POOL_THREADS;
+    }
+    return parsed;
+}
+
+#ifdef _WIN32
+static CRITICAL_SECTION pool_cs;
+static CONDITION_VARIABLE pool_cv;
+static HANDLE pool_threads[MPS_MAX_POOL_THREADS];
 
 static DWORD WINAPI worker_thread(LPVOID lpParam) {
     (void)lpParam;
@@ -202,7 +249,7 @@ static DWORD WINAPI worker_thread(LPVOID lpParam) {
 
         if (task != NULL) {
             task->fn(task->arg);
-            
+
             EnterCriticalSection(&task->cs);
             task->completed = true;
             LeaveCriticalSection(&task->cs);
@@ -211,16 +258,62 @@ static DWORD WINAPI worker_thread(LPVOID lpParam) {
     }
     return 0;
 }
+#else
+static pthread_mutex_t pool_cs = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t pool_cv = PTHREAD_COND_INITIALIZER;
+static pthread_t pool_threads[MPS_MAX_POOL_THREADS];
+
+static void* worker_thread(void* lpParam) {
+    (void)lpParam;
+    while (1) {
+        MPS_Task* task = NULL;
+        pthread_mutex_lock(&pool_cs);
+        while (queue_head == NULL && !pool_shutdown) {
+            pthread_cond_wait(&pool_cv, &pool_cs);
+        }
+        if (pool_shutdown) {
+            pthread_mutex_unlock(&pool_cs);
+            break;
+        }
+        task = queue_head;
+        if (queue_head != NULL) {
+            queue_head = queue_head->next;
+            if (queue_head == NULL) {
+                queue_tail = NULL;
+            }
+        }
+        pthread_mutex_unlock(&pool_cs);
+
+        if (task != NULL) {
+            task->fn(task->arg);
+
+            pthread_mutex_lock(&task->cs);
+            task->completed = true;
+            pthread_mutex_unlock(&task->cs);
+            pthread_cond_broadcast(&task->cv);
+        }
+    }
+    return NULL;
+}
 #endif
 
 static inline void mps_pool_init() {
 #ifdef MPS_RUNTIME_IMPL
     if (pool_initialized) return;
+    pool_thread_count = mps_pool_requested_thread_count();
+#ifdef _WIN32
     InitializeCriticalSection(&pool_cs);
     InitializeConditionVariable(&pool_cv);
     for (int i = 0; i < pool_thread_count; i++) {
         pool_threads[i] = CreateThread(NULL, 0, worker_thread, NULL, 0, NULL);
     }
+#else
+    pthread_mutex_init(&pool_cs, NULL);
+    pthread_cond_init(&pool_cv, NULL);
+    for (int i = 0; i < pool_thread_count; i++) {
+        pthread_create(&pool_threads[i], NULL, worker_thread, NULL);
+    }
+#endif
     pool_initialized = true;
 #endif
 }
@@ -229,10 +322,16 @@ static inline void mps_pool_submit(MPS_Task* task) {
 #ifdef MPS_RUNTIME_IMPL
     mps_pool_init();
     task->completed = false;
+#ifdef _WIN32
     InitializeConditionVariable(&task->cv);
     InitializeCriticalSection(&task->cs);
+#else
+    pthread_cond_init(&task->cv, NULL);
+    pthread_mutex_init(&task->cs, NULL);
+#endif
     task->next = NULL;
 
+#ifdef _WIN32
     EnterCriticalSection(&pool_cs);
     if (queue_tail == NULL) {
         queue_head = task;
@@ -244,17 +343,39 @@ static inline void mps_pool_submit(MPS_Task* task) {
     LeaveCriticalSection(&pool_cs);
     WakeConditionVariable(&pool_cv);
 #else
+    pthread_mutex_lock(&pool_cs);
+    if (queue_tail == NULL) {
+        queue_head = task;
+        queue_tail = task;
+    } else {
+        queue_tail->next = task;
+        queue_tail = task;
+    }
+    pthread_mutex_unlock(&pool_cs);
+    pthread_cond_signal(&pool_cv);
+#endif
+#else
     (void)task;
 #endif
 }
 
 static inline void mps_task_await(MPS_Task* task) {
+#ifdef _WIN32
     EnterCriticalSection(&task->cs);
     while (!task->completed) {
         SleepConditionVariableCS(&task->cv, &task->cs, INFINITE);
     }
     LeaveCriticalSection(&task->cs);
+#else
+    pthread_mutex_lock(&task->cs);
+    while (!task->completed) {
+        pthread_cond_wait(&task->cv, &task->cs);
+    }
+    pthread_mutex_unlock(&task->cs);
+#endif
 }
+
+#endif /* MPS_RUNTIME_IMPL */
 
 /* --- Basic Types and Collections FFI / Native Fallback --- */
 #ifdef MPS_USE_PYTHON
@@ -545,8 +666,131 @@ static inline PyObject* mps_dict_new(int pair_count, ...) {
     return dict;
 }
 
+#ifndef MPS_USE_PYTHON
+static inline PyObject* PySlice_New(PyObject* start, PyObject* stop, PyObject* step) {
+    PyObject* obj = mps_obj_alloc(OBJ_SLICE);
+    obj->value.slice_val = (MPS_SliceImpl*)malloc(sizeof(MPS_SliceImpl));
+    Py_XINCREF(start);
+    Py_XINCREF(stop);
+    Py_XINCREF(step);
+    obj->value.slice_val->start = start;
+    obj->value.slice_val->stop = stop;
+    obj->value.slice_val->step = step;
+    return obj;
+}
+
+static inline PyObject* PySequence_GetItem(PyObject* o, int i) {
+    if (o == NULL) return NULL;
+    if (o->type == OBJ_LIST || o->type == OBJ_TUPLE) {
+        if (i >= 0 && i < o->value.list_val->size) {
+            PyObject* item = o->value.list_val->items[i];
+            Py_XINCREF(item);
+            return item;
+        }
+    } else if (o->type == OBJ_STRING) {
+        const char* char_str = mps_str_get_char(o->value.string_val, i);
+        return _to_py_string(char_str);
+    }
+    return NULL;
+}
+#endif
+
+static inline const char* mps_str_slice(const char* s, int start, int end) {
+    if (s == NULL) return "";
+    int len = (int)strlen(s);
+    int real_start = (start == -1) ? 0 : (start < 0 ? len + start : start);
+    int real_end = (end == -1) ? len : (end < 0 ? len + end : end);
+    
+    if (real_start < 0) real_start = 0;
+    if (real_start > len) real_start = len;
+    if (real_end < 0) real_end = 0;
+    if (real_end > len) real_end = len;
+    if (real_end < real_start) real_end = real_start;
+    
+    int slice_len = real_end - real_start;
+    char* res = (char*)malloc(slice_len + 1);
+    memcpy(res, s + real_start, slice_len);
+    res[slice_len] = '\0';
+    return res;
+}
+
 static inline PyObject* PyObject_GetItem(PyObject* obj, PyObject* key) {
     if (obj == NULL || key == NULL) return NULL;
+    if (key->type == OBJ_SLICE) {
+        if (obj->type == OBJ_LIST || obj->type == OBJ_TUPLE) {
+            MPS_SliceImpl* slice = key->value.slice_val;
+            int size = obj->value.list_val->size;
+            
+            int start = 0;
+            if (slice->start != NULL && slice->start != Py_None && slice->start->type == OBJ_INT) {
+                start = slice->start->value.int_val;
+                if (start < 0) start += size;
+            }
+            if (start < 0) start = 0;
+            if (start > size) start = size;
+            
+            int stop = size;
+            if (slice->stop != NULL && slice->stop != Py_None && slice->stop->type == OBJ_INT) {
+                stop = slice->stop->value.int_val;
+                if (stop < 0) stop += size;
+            }
+            if (stop < 0) stop = 0;
+            if (stop > size) stop = size;
+            
+            int step = 1;
+            if (slice->step != NULL && slice->step != Py_None && slice->step->type == OBJ_INT) {
+                step = slice->step->value.int_val;
+            }
+            if (step == 0) step = 1;
+            
+            int slice_size = 0;
+            if (step > 0) {
+                for (int i = start; i < stop; i += step) slice_size++;
+            } else {
+                for (int i = start; i > stop; i += step) slice_size++;
+            }
+            
+            PyObject* result = (obj->type == OBJ_LIST) ? PyList_New(slice_size) : PyTuple_New(slice_size);
+            int idx = 0;
+            if (step > 0) {
+                for (int i = start; i < stop; i += step) {
+                    PyObject* item = obj->value.list_val->items[i];
+                    Py_XINCREF(item);
+                    if (obj->type == OBJ_LIST) {
+                        PyList_SetItem(result, idx++, item);
+                    } else {
+                        PyTuple_SetItem(result, idx++, item);
+                    }
+                }
+            } else {
+                for (int i = start; i > stop; i += step) {
+                    PyObject* item = obj->value.list_val->items[i];
+                    Py_XINCREF(item);
+                    if (obj->type == OBJ_LIST) {
+                        PyList_SetItem(result, idx++, item);
+                    } else {
+                        PyTuple_SetItem(result, idx++, item);
+                    }
+                }
+            }
+            return result;
+        } else if (obj->type == OBJ_STRING) {
+            MPS_SliceImpl* slice = key->value.slice_val;
+            int len = (int)strlen(obj->value.string_val);
+            int start = -1;
+            if (slice->start != NULL && slice->start != Py_None && slice->start->type == OBJ_INT) {
+                start = slice->start->value.int_val;
+            }
+            int stop = -1;
+            if (slice->stop != NULL && slice->stop != Py_None && slice->stop->type == OBJ_INT) {
+                stop = slice->stop->value.int_val;
+            }
+            const char* sliced_str = mps_str_slice(obj->value.string_val, start, stop);
+            PyObject* res_obj = _to_py_string(sliced_str);
+            free((void*)sliced_str);
+            return res_obj;
+        }
+    }
     if (obj->type == OBJ_LIST || obj->type == OBJ_TUPLE) {
         int idx = key->type == OBJ_INT ? key->value.int_val : 0;
         if (idx >= 0 && idx < obj->value.list_val->size) {
@@ -885,17 +1129,37 @@ static inline void Py_Finalize() {}
 #endif /* MPS_USE_PYTHON */
 
 /* --- Native Matrix Definition and BLAS Helpers --- */
+#ifdef MPS_USE_BLAS
+#ifdef _MSC_VER
+#include <openblas/cblas.h>
+#else
+#include <cblas.h>
+#endif
+#ifndef CblasRowMajor
+#define CblasRowMajor 101
+#endif
+#ifndef CblasNoTrans
+#define CblasNoTrans 111
+#endif
+#endif
+
 typedef struct {
     double* data;
     int rows;
     int cols;
 } MPSMatrix;
 
+typedef struct {
+    float* data;
+    int rows;
+    int cols;
+} MPSMatrix32;
+
 static inline MPSMatrix* matrix_new(int rows, int cols) {
     MPSMatrix* m = (MPSMatrix*)malloc(sizeof(MPSMatrix));
     m->rows = rows;
     m->cols = cols;
-    m->data = (double*)calloc(rows * cols, sizeof(double));
+    m->data = (double*)malloc(rows * cols * sizeof(double));
     return m;
 }
 
@@ -932,7 +1196,27 @@ static inline MPSMatrix* matrix_mul(MPSMatrix* a, MPSMatrix* b) {
     }
     MPSMatrix* c = matrix_new(a->rows, b->cols);
     
-    double* b_T = (double*)malloc(sizeof(double) * b->rows * b->cols);
+#ifdef MPS_USE_BLAS
+    cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                a->rows, b->cols, a->cols, 1.0,
+                a->data, a->cols, b->data, b->cols,
+                0.0, c->data, b->cols);
+#else
+    int b_size = b->rows * b->cols;
+    double* b_T;
+    double stack_buf[1024];
+    if (b_size <= 1024) {
+        b_T = stack_buf;
+    } else {
+        static THREAD_LOCAL double* tl_buf = NULL;
+        static THREAD_LOCAL int tl_cap = 0;
+        if (b_size > tl_cap) {
+            tl_cap = b_size * 2;
+            tl_buf = (double*)realloc(tl_buf, sizeof(double) * tl_cap);
+        }
+        b_T = tl_buf;
+    }
+    
     for (int r = 0; r < b->rows; r++) {
         for (int col = 0; col < b->cols; col++) {
             b_T[col * b->rows + r] = b->data[r * b->cols + col];
@@ -951,8 +1235,175 @@ static inline MPSMatrix* matrix_mul(MPSMatrix* a, MPSMatrix* b) {
             c->data[c_offset + j] = sum;
         }
     }
-    free(b_T);
+#endif
     return c;
+}
+
+static inline MPSMatrix* matrix_add(MPSMatrix* a, MPSMatrix* b) {
+    if (a == NULL || b == NULL || a->rows != b->rows || a->cols != b->cols) {
+        fprintf(stderr, "Error: Matrix dimensions mismatch for addition.\n");
+        exit(1);
+    }
+    MPSMatrix* c = matrix_new(a->rows, a->cols);
+    int size = a->rows * a->cols;
+    for (int i = 0; i < size; i++) {
+        c->data[i] = a->data[i] + b->data[i];
+    }
+    return c;
+}
+
+static inline MPSMatrix* matrix_relu(MPSMatrix* a) {
+    if (a == NULL) return NULL;
+    MPSMatrix* c = matrix_new(a->rows, a->cols);
+    int size = a->rows * a->cols;
+    for (int i = 0; i < size; i++) {
+        c->data[i] = a->data[i] > 0.0 ? a->data[i] : 0.0;
+    }
+    return c;
+}
+
+/* --- float32 MPSMatrix32 operations --- */
+static inline MPSMatrix32* matrix32_new(int rows, int cols) {
+    MPSMatrix32* m = (MPSMatrix32*)malloc(sizeof(MPSMatrix32));
+    m->rows = rows;
+    m->cols = cols;
+    m->data = (float*)malloc(rows * cols * sizeof(float));
+    return m;
+}
+
+static inline void matrix32_free(MPSMatrix32* m) {
+    if (m != NULL) {
+        if (m->data != NULL) {
+            free(m->data);
+        }
+        free(m);
+    }
+}
+
+static inline float matrix32_get(MPSMatrix32* m, int r, int c) {
+    if (m == NULL || r < 0 || r >= m->rows || c < 0 || c >= m->cols) {
+        fprintf(stderr, "Index Error: Matrix32 subscript out of bounds.\n");
+        exit(1);
+    }
+    return m->data[r * m->cols + c];
+}
+
+static inline void matrix32_set(MPSMatrix32* m, int r, int c, float val) {
+    if (m == NULL || r < 0 || r >= m->rows || c < 0 || c >= m->cols) {
+        fprintf(stderr, "Index Error: Matrix32 subscript out of bounds.\n");
+        exit(1);
+    }
+    m->data[r * m->cols + c] = val;
+}
+
+static inline MPSMatrix32* matrix32_mul(MPSMatrix32* a, MPSMatrix32* b) {
+    if (a == NULL || b == NULL || a->cols != b->rows) {
+        fprintf(stderr, "Error: Matrix32 dimensions mismatch for multiplication (%dx%d vs %dx%d).\n", 
+                a ? a->rows : 0, a ? a->cols : 0, b ? b->rows : 0, b ? b->cols : 0);
+        exit(1);
+    }
+    MPSMatrix32* c = matrix32_new(a->rows, b->cols);
+    
+#ifdef MPS_USE_BLAS
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                a->rows, b->cols, a->cols, 1.0f,
+                a->data, a->cols, b->data, b->cols,
+                0.0f, c->data, b->cols);
+#else
+    int b_size = b->rows * b->cols;
+    float* b_T;
+    float stack_buf[1024];
+    if (b_size <= 1024) {
+        b_T = stack_buf;
+    } else {
+        static THREAD_LOCAL float* tl_buf = NULL;
+        static THREAD_LOCAL int tl_cap = 0;
+        if (b_size > tl_cap) {
+            tl_cap = b_size * 2;
+            tl_buf = (float*)realloc(tl_buf, sizeof(float) * tl_cap);
+        }
+        b_T = tl_buf;
+    }
+    
+    for (int r = 0; r < b->rows; r++) {
+        for (int col = 0; col < b->cols; col++) {
+            b_T[col * b->rows + r] = b->data[r * b->cols + col];
+        }
+    }
+    
+    for (int i = 0; i < a->rows; i++) {
+        int a_offset = i * a->cols;
+        int c_offset = i * c->cols;
+        for (int j = 0; j < b->cols; j++) {
+            float sum = 0.0f;
+            int b_offset = j * b->rows;
+            for (int k = 0; k < a->cols; k++) {
+                sum += a->data[a_offset + k] * b_T[b_offset + k];
+            }
+            c->data[c_offset + j] = sum;
+        }
+    }
+#endif
+    return c;
+}
+
+static inline MPSMatrix32* matrix32_add(MPSMatrix32* a, MPSMatrix32* b) {
+    if (a == NULL || b == NULL || a->rows != b->rows || a->cols != b->cols) {
+        fprintf(stderr, "Error: Matrix32 dimensions mismatch for addition.\n");
+        exit(1);
+    }
+    MPSMatrix32* c = matrix32_new(a->rows, a->cols);
+    int size = a->rows * a->cols;
+    for (int i = 0; i < size; i++) {
+        c->data[i] = a->data[i] + b->data[i];
+    }
+    return c;
+}
+
+static inline MPSMatrix32* matrix32_relu(MPSMatrix32* a) {
+    if (a == NULL) return NULL;
+    MPSMatrix32* c = matrix32_new(a->rows, a->cols);
+    int size = a->rows * a->cols;
+    for (int i = 0; i < size; i++) {
+        c->data[i] = a->data[i] > 0.0f ? a->data[i] : 0.0f;
+    }
+    return c;
+}
+
+/* --- Random Number Generation --- */
+static THREAD_LOCAL uint64_t mps_rng_state = 0x853c49e6748fea9bULL;
+static THREAD_LOCAL uint64_t mps_rng_inc = 0xda3e39cb94b95bdbULL;
+
+static inline uint32_t mps_pcg32_next(void) {
+    uint64_t oldstate = mps_rng_state;
+    mps_rng_state = oldstate * 6364136223846793005ULL + mps_rng_inc;
+    uint32_t xorshifted = (uint32_t)(((oldstate >> 18u) ^ oldstate) >> 27u);
+    uint32_t rot = (uint32_t)(oldstate >> 59u);
+    return (xorshifted >> rot) | (xorshifted << ((-rot) & 31));
+}
+
+static inline void mps_random_seed(int seed) {
+    mps_rng_state = (uint64_t)seed + 1442695040888963407ULL;
+    mps_rng_inc = 1442695040888963407ULL | 1;
+    (void)mps_pcg32_next();
+}
+
+static inline double mps_random(void) {
+    if (mps_rng_state == 0x853c49e6748fea9bULL) {
+        mps_random_seed((int)time(NULL));
+    }
+    uint32_t val = mps_pcg32_next();
+    return (double)val / 4294967296.0;
+}
+
+static inline int mps_randint(int min, int max) {
+    if (mps_rng_state == 0x853c49e6748fea9bULL) {
+        mps_random_seed((int)time(NULL));
+    }
+    if (min >= max) return min;
+    uint32_t range = (uint32_t)(max - min + 1);
+    uint32_t val = mps_pcg32_next();
+    return min + (int)(val % range);
 }
 
 /* --- Printing Utilities --- */
@@ -1029,6 +1480,16 @@ static inline void _print_pyobject_raw(PyObject* obj) {
             break;
         }
         case OBJ_ITER: printf("<iterator>"); break;
+        case OBJ_SLICE: {
+            printf("slice(");
+            _print_pyobject_raw(obj->value.slice_val->start);
+            printf(", ");
+            _print_pyobject_raw(obj->value.slice_val->stop);
+            printf(", ");
+            _print_pyobject_raw(obj->value.slice_val->step);
+            printf(")");
+            break;
+        }
         case OBJ_NULL: printf("null"); break;
     }
 }
@@ -1060,6 +1521,27 @@ static inline void _print_matrix(MPSMatrix* m) {
     }
 }
 
+static inline void _print_matrix32(MPSMatrix32* m) {
+    if (m == NULL) {
+        printf("Matrix32: NULL\n");
+        return;
+    }
+    printf("Matrix32 (%dx%d):\n", m->rows, m->cols);
+    int max_rows = m->rows > 10 ? 10 : m->rows;
+    int max_cols = m->cols > 10 ? 10 : m->cols;
+    for (int i = 0; i < max_rows; i++) {
+        printf("  [ ");
+        for (int j = 0; j < max_cols; j++) {
+            printf("%g ", (double)m->data[i * m->cols + j]);
+        }
+        if (m->cols > 10) printf("... ");
+        printf("]\n");
+    }
+    if (m->rows > 10) {
+        printf("  ...\n");
+    }
+}
+
 #define print(X) _Generic((X), \
     const char*: _print_string, \
     char*: _print_string, \
@@ -1068,7 +1550,8 @@ static inline void _print_matrix(MPSMatrix* m) {
     float: _print_double, \
     bool: _print_bool, \
     PyObject*: _print_pyobject, \
-    MPSMatrix*: _print_matrix \
+    MPSMatrix*: _print_matrix, \
+    MPSMatrix32*: _print_matrix32 \
 )(X)
 
 #define mps_print(X) print(X)
