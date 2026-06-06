@@ -114,6 +114,14 @@ impl Codegen {
         func_env.insert("tensor32_exp".to_string(), Type::Custom("Tensor32".to_string()));
         func_env.insert("tensor32_log".to_string(), Type::Custom("Tensor32".to_string()));
 
+        func_env.insert("tensor_zeros".to_string(), Type::Custom("Tensor".to_string()));
+        func_env.insert("tensor_ones".to_string(), Type::Custom("Tensor".to_string()));
+        func_env.insert("tensor_randn".to_string(), Type::Custom("Tensor".to_string()));
+
+        func_env.insert("tensor32_zeros".to_string(), Type::Custom("Tensor32".to_string()));
+        func_env.insert("tensor32_ones".to_string(), Type::Custom("Tensor32".to_string()));
+        func_env.insert("tensor32_randn".to_string(), Type::Custom("Tensor32".to_string()));
+
         let mut var_env = HashMap::new();
         var_env.insert("MPS_PI".to_string(), Type::Float);
         var_env.insert("MPS_E".to_string(), Type::Float);
@@ -296,7 +304,7 @@ impl Codegen {
             BinOp::Le => Some("<="),
             BinOp::Gt => Some(">"),
             BinOp::Ge => Some(">="),
-            BinOp::Pow | BinOp::And | BinOp::Or => None,
+            BinOp::Pow | BinOp::And | BinOp::Or | BinOp::MatMul => None,
         }
     }
 
@@ -338,6 +346,31 @@ impl Codegen {
             }
         }
         None
+    }
+
+    fn get_direct_indices(&self, index_expr: &Expr) -> Option<Vec<Expr>> {
+        match index_expr {
+            Expr::TupleLiteral(elts) => {
+                for elt in elts {
+                    if let Ok(elt_t) = self.infer_type(elt) {
+                        if elt_t != Type::Int {
+                            return None;
+                        }
+                    } else {
+                        return None;
+                    }
+                }
+                Some(elts.clone())
+            }
+            _ => {
+                if let Ok(t) = self.infer_type(index_expr) {
+                    if t == Type::Int {
+                        return Some(vec![index_expr.clone()]);
+                    }
+                }
+                None
+            }
+        }
     }
 
     fn infer_type(&self, expr: &Expr) -> Result<Type, String> {
@@ -445,6 +478,38 @@ impl Codegen {
                     BinOp::Pow => Ok(Type::Float),
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                         Ok(Type::Bool)
+                    }
+                    BinOp::MatMul => {
+                        let is_tensor_left = match &left_t { Type::Custom(c) => c == "Tensor" || c == "Tensor32" || c.starts_with("Tensor<"), _ => false };
+                        let is_tensor_right = match &right_t { Type::Custom(c) => c == "Tensor" || c == "Tensor32" || c.starts_with("Tensor<"), _ => false };
+                        if is_tensor_left && is_tensor_right {
+                            let is_f32_l = match &left_t { Type::Custom(c) => c == "Tensor32" || c.contains("float32"), _ => false };
+                            let is_f32_r = match &right_t { Type::Custom(c) => c == "Tensor32" || c.contains("float32"), _ => false };
+                            if is_f32_l || is_f32_r {
+                                return Ok(Type::Custom("Tensor32".to_string()));
+                            } else {
+                                return Ok(Type::Custom("Tensor".to_string()));
+                            }
+                        }
+                        let is_matrix_left = match &left_t { Type::Custom(c) => c == "Matrix" || c == "Matrix32" || c.starts_with("Matrix<"), _ => false };
+                        let is_matrix_right = match &right_t { Type::Custom(c) => c == "Matrix" || c == "Matrix32" || c.starts_with("Matrix<"), _ => false };
+                        if is_matrix_left && is_matrix_right {
+                            let is_f32_l = match &left_t { Type::Custom(c) => c == "Matrix32" || c.contains("float32"), _ => false };
+                            let is_f32_r = match &right_t { Type::Custom(c) => c == "Matrix32" || c.contains("float32"), _ => false };
+                            if is_f32_l || is_f32_r {
+                                return Ok(Type::Custom("Matrix32".to_string()));
+                            } else {
+                                return Ok(Type::Custom("Matrix".to_string()));
+                            }
+                        }
+                        if let Type::Custom(class_name) = &left_t {
+                            if let Some((def_class, _)) = self.resolve_method(class_name, "matmul") {
+                                let def_info = self.classes.get(&def_class).unwrap();
+                                let meth_info = def_info.methods.get("matmul").unwrap();
+                                return Ok(meth_info.return_type.clone());
+                            }
+                        }
+                        Ok(Type::PyObject)
                     }
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Percent => {
                         // String concatenation: string + anything = string
@@ -596,7 +661,7 @@ impl Codegen {
                             return Ok(Type::Void);
                         } else if method == "shape" || method == "strides" {
                             return Ok(Type::PyObject);
-                        } else if method == "sigmoid" || method == "relu" || method == "softmax" || method == "exp" || method == "log" {
+                        } else if method == "sigmoid" || method == "relu" || method == "softmax" || method == "exp" || method == "log" || method == "reshape" || method == "transpose" || method == "squeeze" || method == "matmul" {
                             return Ok(Type::Custom(class_name.clone()));
                         } else {
                             return Err(format!("Type Error: Native Tensor does not have method '{}'", method));
@@ -608,7 +673,7 @@ impl Codegen {
                             return Ok(Type::Void);
                         } else if method == "shape" || method == "strides" {
                             return Ok(Type::PyObject);
-                        } else if method == "sigmoid" || method == "relu" || method == "softmax" || method == "exp" || method == "log" {
+                        } else if method == "sigmoid" || method == "relu" || method == "softmax" || method == "exp" || method == "log" || method == "reshape" || method == "transpose" || method == "squeeze" || method == "matmul" {
                             return Ok(Type::Custom("Tensor32".to_string()));
                         } else {
                             return Err(format!("Type Error: Native Tensor32 does not have method '{}'", method));
@@ -1453,20 +1518,46 @@ impl Codegen {
                         let mut block_statements = Vec::new();
                         self.enter_block();
                         let obj_code = self.flatten_expression(object, &mut block_statements)?;
-                        let index_code = self.flatten_expression(index, &mut block_statements)?;
+                        
+                        let is_tensor_direct = if let Type::Custom(ref class_name) = obj_t {
+                            (class_name == "Tensor" || class_name.starts_with("Tensor<") || class_name == "Tensor32") && self.get_direct_indices(index).is_some()
+                        } else {
+                            false
+                        };
+
+                        let idx_info = if is_tensor_direct {
+                            let elts = self.get_direct_indices(index).unwrap();
+                            let mut idx_codes = Vec::new();
+                            for elt in &elts {
+                                idx_codes.push(self.flatten_expression(elt, &mut block_statements)?);
+                            }
+                            let idx_count = idx_codes.len();
+                            let array_literal = format!("(const int[]){{{}}}", idx_codes.join(", "));
+                            Some((idx_count, array_literal))
+                        } else {
+                            None
+                        };
+
+                        let index_code = if idx_info.is_none() {
+                            Some(self.flatten_expression(index, &mut block_statements)?)
+                        } else {
+                            None
+                        };
+
                         let val_code = self.flatten_expression(value, &mut block_statements)?;
                         let cleanups = self.exit_block();
 
                         if obj_t == Type::PyObject {
+                            let idx_c = index_code.unwrap();
                             if block_statements.is_empty() {
-                                Ok(format!("{}PyObject_SetItem({}, to_py({}), to_py({}));\n", self.indent(), obj_code, index_code, val_code))
+                                Ok(format!("{}PyObject_SetItem({}, to_py({}), to_py({}));\n", self.indent(), obj_code, idx_c, val_code))
                             } else {
                                 let mut out = format!("{}{{\n", self.indent());
                                 self.indent_level += 1;
                                 for stmt in block_statements {
                                     out.push_str(&format!("{}{}\n", self.indent(), stmt));
                                 }
-                                out.push_str(&format!("{}PyObject_SetItem({}, to_py({}), to_py({}));\n", self.indent(), obj_code, index_code, val_code));
+                                out.push_str(&format!("{}PyObject_SetItem({}, to_py({}), to_py({}));\n", self.indent(), obj_code, idx_c, val_code));
                                 out.push_str(&cleanups);
                                 self.indent_level -= 1;
                                 out.push_str(&format!("{}}}\n", self.indent()));
@@ -1478,20 +1569,39 @@ impl Codegen {
                             if is_tensor || is_tensor32 {
                                 let is_f32 = is_tensor32 || class_name.contains("float32");
                                 let cast_type = if is_f32 { "float" } else { "double" };
-                                let setter_fn = if is_f32 { "tensor32_set" } else { "tensor_set" };
-                                if block_statements.is_empty() {
-                                    Ok(format!("{}{}({}, to_py({}), ({})({}));\n", self.indent(), setter_fn, obj_code, index_code, cast_type, val_code))
-                                } else {
-                                    let mut out = format!("{}{{\n", self.indent());
-                                    self.indent_level += 1;
-                                    for stmt in block_statements {
-                                        out.push_str(&format!("{}{}\n", self.indent(), stmt));
+                                if let Some((idx_count, array_literal)) = idx_info {
+                                    let setter_fn = if is_f32 { "tensor32_set_direct" } else { "tensor_set_direct" };
+                                    if block_statements.is_empty() {
+                                        Ok(format!("{}{}({}, {}, {}, ({})({}));\n", self.indent(), setter_fn, obj_code, idx_count, array_literal, cast_type, val_code))
+                                    } else {
+                                        let mut out = format!("{}{{\n", self.indent());
+                                        self.indent_level += 1;
+                                        for stmt in block_statements {
+                                            out.push_str(&format!("{}{}\n", self.indent(), stmt));
+                                        }
+                                        out.push_str(&format!("{}{}({}, {}, {}, ({})({}));\n", self.indent(), setter_fn, obj_code, idx_count, array_literal, cast_type, val_code));
+                                        out.push_str(&cleanups);
+                                        self.indent_level -= 1;
+                                        out.push_str(&format!("{}}}\n", self.indent()));
+                                        Ok(out)
                                     }
-                                    out.push_str(&format!("{}{}({}, to_py({}), ({})({}));\n", self.indent(), setter_fn, obj_code, index_code, cast_type, val_code));
-                                    out.push_str(&cleanups);
-                                    self.indent_level -= 1;
-                                    out.push_str(&format!("{}}}\n", self.indent()));
-                                    Ok(out)
+                                } else {
+                                    let setter_fn = if is_f32 { "tensor32_set" } else { "tensor_set" };
+                                    let idx_c = index_code.unwrap();
+                                    if block_statements.is_empty() {
+                                        Ok(format!("{}{}({}, to_py({}), ({})({}));\n", self.indent(), setter_fn, obj_code, idx_c, cast_type, val_code))
+                                    } else {
+                                        let mut out = format!("{}{{\n", self.indent());
+                                        self.indent_level += 1;
+                                        for stmt in block_statements {
+                                            out.push_str(&format!("{}{}\n", self.indent(), stmt));
+                                        }
+                                        out.push_str(&format!("{}{}({}, to_py({}), ({})({}));\n", self.indent(), setter_fn, obj_code, idx_c, cast_type, val_code));
+                                        out.push_str(&cleanups);
+                                        self.indent_level -= 1;
+                                        out.push_str(&format!("{}}}\n", self.indent()));
+                                        Ok(out)
+                                    }
                                 }
                             } else {
                                 Err(format!("Compilation Error: Subscript assignment on non-Python/Tensor object of type '{:?}'", obj_t))
@@ -2146,6 +2256,7 @@ impl Codegen {
                         BinOp::Sub => if is_f32 { "tensor32_sub" } else { "tensor_sub" },
                         BinOp::Mul => if is_f32 { "tensor32_mul" } else { "tensor_mul" },
                         BinOp::Div => if is_f32 { "tensor32_div" } else { "tensor_div" },
+                        BinOp::MatMul => if is_f32 { "tensor32_matmul" } else { "tensor_matmul" },
                         _ => return Err(format!("Compilation Error: Operator '{}' not supported on Tensors", op)),
                     };
                     
@@ -2158,6 +2269,50 @@ impl Codegen {
                         scope.push(temp_name.clone());
                     }
                     return Ok(temp_name);
+                }
+
+                if *op == BinOp::MatMul {
+                    let is_matrix_left = match &left_t { Type::Custom(c) => c == "Matrix" || c == "Matrix32" || c.starts_with("Matrix<"), _ => false };
+                    let is_matrix_right = match &right_t { Type::Custom(c) => c == "Matrix" || c == "Matrix32" || c.starts_with("Matrix<"), _ => false };
+                    if is_matrix_left && is_matrix_right {
+                        let is_f32_l = match &left_t { Type::Custom(c) => c == "Matrix32" || c.contains("float32"), _ => false };
+                        let is_f32_r = match &right_t { Type::Custom(c) => c == "Matrix32" || c.contains("float32"), _ => false };
+                        let is_f32 = is_f32_l || is_f32_r;
+                        let left_code = self.flatten_expression(left, block_statements)?;
+                        let right_code = self.flatten_expression(right, block_statements)?;
+                        let op_fn = if is_f32 { "matrix32_mul" } else { "matrix_mul" };
+                        
+                        self.temp_counter += 1;
+                        let temp_name = format!("_tmp_{}", self.temp_counter);
+                        let matrix_type = if is_f32 { "MPSMatrix32*" } else { "MPSMatrix*" };
+                        block_statements.push(format!("{} {} = {}({}, {});", matrix_type, temp_name, op_fn, left_code, right_code));
+                        self.var_env.insert(temp_name.clone(), Type::Custom(if is_f32 { "Matrix32".to_string() } else { "Matrix".to_string() }));
+                        if let Some(scope) = self.scope_matrix_vars.last_mut() {
+                            scope.push(temp_name.clone());
+                        }
+                        return Ok(temp_name);
+                    }
+                    
+                    let is_tensor_l = match &left_t { Type::Custom(c) => c == "Tensor" || c == "Tensor32" || c.starts_with("Tensor<"), _ => false };
+                    let is_tensor_r = match &right_t { Type::Custom(c) => c == "Tensor" || c == "Tensor32" || c.starts_with("Tensor<"), _ => false };
+                    if is_tensor_l && is_tensor_r {
+                        let is_f32_l = match &left_t { Type::Custom(c) => c == "Tensor32" || c.contains("float32"), _ => false };
+                        let is_f32_r = match &right_t { Type::Custom(c) => c == "Tensor32" || c.contains("float32"), _ => false };
+                        let is_f32 = is_f32_l || is_f32_r;
+                        let left_code = self.flatten_expression(left, block_statements)?;
+                        let right_code = self.flatten_expression(right, block_statements)?;
+                        let op_fn = if is_f32 { "tensor32_matmul" } else { "tensor_matmul" };
+                        
+                        self.temp_counter += 1;
+                        let temp_name = format!("_tmp_{}", self.temp_counter);
+                        let tensor_type = if is_f32 { "MPSTensor32*" } else { "MPSTensor*" };
+                        block_statements.push(format!("{} {} = {}({}, {});", tensor_type, temp_name, op_fn, left_code, right_code));
+                        self.var_env.insert(temp_name.clone(), Type::Custom(if is_f32 { "Tensor32".to_string() } else { "Tensor".to_string() }));
+                        if let Some(scope) = self.scope_matrix_vars.last_mut() {
+                            scope.push(temp_name.clone());
+                        }
+                        return Ok(temp_name);
+                    }
                 }
 
                 if *op == BinOp::And || *op == BinOp::Or {
@@ -2223,6 +2378,7 @@ impl Codegen {
                         BinOp::Le => Some("le"),
                         BinOp::Gt => Some("gt"),
                         BinOp::Ge => Some("ge"),
+                        BinOp::MatMul => Some("matmul"),
                         BinOp::Pow | BinOp::And | BinOp::Or => None,
                     };
                     if let Some(method_name) = op_method {
@@ -2617,7 +2773,7 @@ impl Codegen {
                         } else {
                             return Err(format!("Compilation Error: Native Matrix32 does not have method '{}'", method));
                         }
-                    } else if class_name == "Tensor" {
+                    } else if class_name == "Tensor" || class_name.starts_with("Tensor<") {
                         let mut arg_codes = Vec::new();
                         for arg in args {
                             arg_codes.push(self.flatten_expression(arg, block_statements)?);
@@ -2631,6 +2787,22 @@ impl Codegen {
                             return Ok(format!("tensor_{}({})", method, obj_code));
                         } else if method == "sigmoid" || method == "relu" || method == "softmax" || method == "exp" || method == "log" {
                             let call_code = format!("tensor_{}({})", method, obj_code);
+                            self.temp_counter += 1;
+                            let temp_name = format!("_tmp_{}", self.temp_counter);
+                            block_statements.push(format!("MPSTensor* {} = {};", temp_name, call_code));
+                            self.var_env.insert(temp_name.clone(), Type::Custom("Tensor".to_string()));
+                            if let Some(scope) = self.scope_matrix_vars.last_mut() {
+                                scope.push(temp_name.clone());
+                            }
+                            return Ok(temp_name);
+                        } else if method == "reshape" || method == "transpose" || method == "squeeze" || method == "matmul" {
+                            let call_code = match method.as_str() {
+                                "reshape" => format!("tensor_reshape({}, to_py({}))", obj_code, arg_codes[0]),
+                                "transpose" => format!("tensor_transpose({}, {}, {})", obj_code, arg_codes[0], arg_codes[1]),
+                                "squeeze" => format!("tensor_squeeze({}, {})", obj_code, arg_codes[0]),
+                                "matmul" => format!("tensor_matmul({}, {})", obj_code, arg_codes[0]),
+                                _ => unreachable!(),
+                            };
                             self.temp_counter += 1;
                             let temp_name = format!("_tmp_{}", self.temp_counter);
                             block_statements.push(format!("MPSTensor* {} = {};", temp_name, call_code));
@@ -2656,6 +2828,22 @@ impl Codegen {
                             return Ok(format!("tensor32_{}({})", method, obj_code));
                         } else if method == "sigmoid" || method == "relu" || method == "softmax" || method == "exp" || method == "log" {
                             let call_code = format!("tensor32_{}({})", method, obj_code);
+                            self.temp_counter += 1;
+                            let temp_name = format!("_tmp_{}", self.temp_counter);
+                            block_statements.push(format!("MPSTensor32* {} = {};", temp_name, call_code));
+                            self.var_env.insert(temp_name.clone(), Type::Custom("Tensor32".to_string()));
+                            if let Some(scope) = self.scope_matrix_vars.last_mut() {
+                                scope.push(temp_name.clone());
+                            }
+                            return Ok(temp_name);
+                        } else if method == "reshape" || method == "transpose" || method == "squeeze" || method == "matmul" {
+                            let call_code = match method.as_str() {
+                                "reshape" => format!("tensor32_reshape({}, to_py({}))", obj_code, arg_codes[0]),
+                                "transpose" => format!("tensor32_transpose({}, {}, {})", obj_code, arg_codes[0], arg_codes[1]),
+                                "squeeze" => format!("tensor32_squeeze({}, {})", obj_code, arg_codes[0]),
+                                "matmul" => format!("tensor32_matmul({}, {})", obj_code, arg_codes[0]),
+                                _ => unreachable!(),
+                            };
                             self.temp_counter += 1;
                             let temp_name = format!("_tmp_{}", self.temp_counter);
                             block_statements.push(format!("MPSTensor32* {} = {};", temp_name, call_code));
@@ -2720,8 +2908,8 @@ impl Codegen {
             Expr::Subscript { object, index } => {
                 let obj_t = self.infer_type(object)?;
                 let obj_code = self.flatten_expression(object, block_statements)?;
-                let index_code = self.flatten_expression(index, block_statements)?;
                 if obj_t == Type::PyObject {
+                    let index_code = self.flatten_expression(index, block_statements)?;
                     let call_code = format!("PyObject_GetItem({}, to_py({}))", obj_code, index_code);
                     self.temp_counter += 1;
                     let temp_name = format!("_tmp_{}", self.temp_counter);
@@ -2731,23 +2919,36 @@ impl Codegen {
                     }
                     Ok(temp_name)
                 } else if let Type::Custom(ref class_name) = obj_t {
-                    if class_name == "Tensor" || class_name.starts_with("Tensor<") {
-                        let is_f32 = class_name.contains("float32");
-                        if is_f32 {
-                            Ok(format!("tensor32_get({}, to_py({}))", obj_code, index_code))
+                    if class_name == "Tensor" || class_name.starts_with("Tensor<") || class_name == "Tensor32" {
+                        let is_f32 = class_name == "Tensor32" || class_name.contains("float32");
+                        if let Some(elts) = self.get_direct_indices(index) {
+                            let mut idx_codes = Vec::new();
+                            for elt in &elts {
+                                idx_codes.push(self.flatten_expression(elt, block_statements)?);
+                            }
+                            let idx_count = idx_codes.len();
+                            let array_literal = format!("(const int[]){{{}}}", idx_codes.join(", "));
+                            let getter_fn = if is_f32 { "tensor32_get_direct" } else { "tensor_get_direct" };
+                            Ok(format!("{}({}, {}, {})", getter_fn, obj_code, idx_count, array_literal))
                         } else {
-                            Ok(format!("tensor_get({}, to_py({}))", obj_code, index_code))
+                            let index_code = self.flatten_expression(index, block_statements)?;
+                            if is_f32 {
+                                Ok(format!("tensor32_get({}, to_py({}))", obj_code, index_code))
+                            } else {
+                                Ok(format!("tensor_get({}, to_py({}))", obj_code, index_code))
+                            }
                         }
-                    } else if class_name == "Tensor32" {
-                        Ok(format!("tensor32_get({}, to_py({}))", obj_code, index_code))
                     } else if class_name == "Matrix" || class_name.starts_with("Matrix<") {
+                        let index_code = self.flatten_expression(index, block_statements)?;
                         Ok(format!("{}->data[{}]", obj_code, index_code))
                     } else if class_name == "Matrix32" {
+                        let index_code = self.flatten_expression(index, block_statements)?;
                         Ok(format!("{}->data[{}]", obj_code, index_code))
                     } else {
                         Err(format!("Compilation Error: Subscript indexing only supported on Python objects, found '{:?}'", obj_t))
                     }
                 } else if obj_t == Type::String {
+                    let index_code = self.flatten_expression(index, block_statements)?;
                     Ok(format!("mps_str_get_char({}, {})", obj_code, index_code))
                 } else {
                     Err(format!("Compilation Error: Subscript indexing only supported on Python objects, found '{:?}'", obj_t))
@@ -2999,6 +3200,7 @@ impl Codegen {
                         BinOp::Le => Some("le"),
                         BinOp::Gt => Some("gt"),
                         BinOp::Ge => Some("ge"),
+                        BinOp::MatMul => Some("matmul"),
                         BinOp::Pow | BinOp::And | BinOp::Or => None,
                     };
                     if let Some(method_name) = op_method {
@@ -3037,6 +3239,19 @@ impl Codegen {
                             Ok(format!("matrix32_mul({}, {})", left_code, right_code))
                         } else {
                             Ok(format!("({} * {})", left_code, right_code))
+                        }
+                    }
+                    BinOp::MatMul => {
+                        if left_t == Type::Custom("Matrix".to_string()) && right_t == Type::Custom("Matrix".to_string()) {
+                            Ok(format!("matrix_mul({}, {})", left_code, right_code))
+                        } else if left_t == Type::Custom("Matrix32".to_string()) && right_t == Type::Custom("Matrix32".to_string()) {
+                            Ok(format!("matrix32_mul({}, {})", left_code, right_code))
+                        } else if left_t == Type::Custom("Tensor".to_string()) && right_t == Type::Custom("Tensor".to_string()) {
+                            Ok(format!("tensor_matmul({}, {})", left_code, right_code))
+                        } else if left_t == Type::Custom("Tensor32".to_string()) && right_t == Type::Custom("Tensor32".to_string()) {
+                            Ok(format!("tensor32_matmul({}, {})", left_code, right_code))
+                        } else {
+                            Err(format!("Compilation Error: Operator '@' only supported on Matrix or Tensor types"))
                         }
                     }
                     BinOp::Div => Ok(format!("({} / {})", left_code, right_code)),
@@ -3156,6 +3371,87 @@ impl Codegen {
                     }
                 }
                 if let Type::Custom(class_name) = obj_t {
+                    if class_name == "Matrix" {
+                        let obj_code = self.transpile_expression(object)?;
+                        let mut arg_codes = Vec::new();
+                        for arg in args {
+                            arg_codes.push(self.transpile_expression(arg)?);
+                        }
+                        if method == "get" {
+                            return Ok(format!("matrix_get({}, {})", obj_code, arg_codes.join(", ")));
+                        } else if method == "set" {
+                            return Ok(format!("matrix_set({}, {})", obj_code, arg_codes.join(", ")));
+                        } else if method == "mul" {
+                            return Ok(format!("matrix_mul({}, {})", obj_code, arg_codes.join(", ")));
+                        } else {
+                            return Err(format!("Compilation Error: Native Matrix does not have method '{}'", method));
+                        }
+                    } else if class_name == "Matrix32" {
+                        let obj_code = self.transpile_expression(object)?;
+                        let mut arg_codes = Vec::new();
+                        for arg in args {
+                            arg_codes.push(self.transpile_expression(arg)?);
+                        }
+                        if method == "get" {
+                            return Ok(format!("matrix32_get({}, {})", obj_code, arg_codes.join(", ")));
+                        } else if method == "set" {
+                            return Ok(format!("matrix32_set({}, {})", obj_code, arg_codes.join(", ")));
+                        } else if method == "mul" {
+                            return Ok(format!("matrix32_mul({}, {})", obj_code, arg_codes.join(", ")));
+                        } else {
+                            return Err(format!("Compilation Error: Native Matrix32 does not have method '{}'", method));
+                        }
+                    } else if class_name == "Tensor" || class_name.starts_with("Tensor<") {
+                        let obj_code = self.transpile_expression(object)?;
+                        let mut arg_codes = Vec::new();
+                        for arg in args {
+                            arg_codes.push(self.transpile_expression(arg)?);
+                        }
+                        if method == "get" {
+                            return Ok(format!("tensor_get({}, {})", obj_code, arg_codes.join(", ")));
+                        } else if method == "set" {
+                            return Ok(format!("tensor_set({}, {})", obj_code, arg_codes.join(", ")));
+                        } else if method == "shape" || method == "strides" {
+                            return Ok(format!("tensor_{}({})", method, obj_code));
+                        } else if method == "sigmoid" || method == "relu" || method == "softmax" || method == "exp" || method == "log" {
+                            return Ok(format!("tensor_{}({})", method, obj_code));
+                        } else if method == "reshape" {
+                            return Ok(format!("tensor_reshape({}, to_py({}))", obj_code, arg_codes[0]));
+                        } else if method == "transpose" {
+                            return Ok(format!("tensor_transpose({}, {}, {})", obj_code, arg_codes[0], arg_codes[1]));
+                        } else if method == "squeeze" {
+                            return Ok(format!("tensor_squeeze({}, {})", obj_code, arg_codes[0]));
+                        } else if method == "matmul" {
+                            return Ok(format!("tensor_matmul({}, {})", obj_code, arg_codes[0]));
+                        } else {
+                            return Err(format!("Compilation Error: Native Tensor does not have method '{}'", method));
+                        }
+                    } else if class_name == "Tensor32" {
+                        let obj_code = self.transpile_expression(object)?;
+                        let mut arg_codes = Vec::new();
+                        for arg in args {
+                            arg_codes.push(self.transpile_expression(arg)?);
+                        }
+                        if method == "get" {
+                            return Ok(format!("tensor32_get({}, {})", obj_code, arg_codes.join(", ")));
+                        } else if method == "set" {
+                            return Ok(format!("tensor32_set({}, {})", obj_code, arg_codes.join(", ")));
+                        } else if method == "shape" || method == "strides" {
+                            return Ok(format!("tensor32_{}({})", method, obj_code));
+                        } else if method == "sigmoid" || method == "relu" || method == "softmax" || method == "exp" || method == "log" {
+                            return Ok(format!("tensor32_{}({})", method, obj_code));
+                        } else if method == "reshape" {
+                            return Ok(format!("tensor32_reshape({}, to_py({}))", obj_code, arg_codes[0]));
+                        } else if method == "transpose" {
+                            return Ok(format!("tensor32_transpose({}, {}, {})", obj_code, arg_codes[0], arg_codes[1]));
+                        } else if method == "squeeze" {
+                            return Ok(format!("tensor32_squeeze({}, {})", obj_code, arg_codes[0]));
+                        } else if method == "matmul" {
+                            return Ok(format!("tensor32_matmul({}, {})", obj_code, arg_codes[0]));
+                        } else {
+                            return Err(format!("Compilation Error: Native Tensor32 does not have method '{}'", method));
+                        }
+                    }
                     if let Some((def_class, cast)) = self.resolve_method(&class_name, method) {
                         let obj_code = self.transpile_expression(object)?;
                         let mut arg_codes = Vec::new();
@@ -3197,12 +3493,41 @@ impl Codegen {
             Expr::Subscript { object, index } => {
                 let obj_t = self.infer_type(object)?;
                 let obj_code = self.transpile_expression(object)?;
-                let index_code = self.transpile_expression(index)?;
                 if obj_t == Type::PyObject {
+                    let index_code = self.transpile_expression(index)?;
                     Ok(format!("PyObject_GetItem({}, to_py({}))", obj_code, index_code))
+                } else if let Type::Custom(ref class_name) = obj_t {
+                    if class_name == "Tensor" || class_name.starts_with("Tensor<") || class_name == "Tensor32" {
+                        let is_f32 = class_name == "Tensor32" || class_name.contains("float32");
+                        if let Some(elts) = self.get_direct_indices(index) {
+                            let mut idx_codes = Vec::new();
+                            for elt in &elts {
+                                idx_codes.push(self.transpile_expression(elt)?);
+                            }
+                            let idx_count = idx_codes.len();
+                            let array_literal = format!("(const int[]){{{}}}", idx_codes.join(", "));
+                            let getter_fn = if is_f32 { "tensor32_get_direct" } else { "tensor_get_direct" };
+                            Ok(format!("{}({}, {}, {})", getter_fn, obj_code, idx_count, array_literal))
+                        } else {
+                            let index_code = self.transpile_expression(index)?;
+                            if is_f32 {
+                                Ok(format!("tensor32_get({}, to_py({}))", obj_code, index_code))
+                            } else {
+                                Ok(format!("tensor_get({}, to_py({}))", obj_code, index_code))
+                            }
+                        }
+                    } else if class_name == "Matrix" || class_name.starts_with("Matrix<") || class_name == "Matrix32" {
+                        let index_code = self.transpile_expression(index)?;
+                        Ok(format!("{}->data[{}]", obj_code, index_code))
+                    } else {
+                        let index_code = self.transpile_expression(index)?;
+                        Ok(format!("{}[{}]", obj_code, index_code))
+                    }
                 } else if obj_t == Type::String {
+                    let index_code = self.transpile_expression(index)?;
                     Ok(format!("mps_str_get_char({}, {})", obj_code, index_code))
                 } else {
+                    let index_code = self.transpile_expression(index)?;
                     Ok(format!("{}[{}]", obj_code, index_code))
                 }
             }

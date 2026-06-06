@@ -95,6 +95,13 @@ impl TypeChecker {
         functions.insert("tensor32_exp".to_string(), (vec![Type::Custom("Tensor32".to_string())], Type::Custom("Tensor32".to_string())));
         functions.insert("tensor32_log".to_string(), (vec![Type::Custom("Tensor32".to_string())], Type::Custom("Tensor32".to_string())));
 
+        functions.insert("tensor_zeros".to_string(), (vec![Type::PyObject], Type::Custom("Tensor".to_string())));
+        functions.insert("tensor_ones".to_string(), (vec![Type::PyObject], Type::Custom("Tensor".to_string())));
+        functions.insert("tensor_randn".to_string(), (vec![Type::PyObject], Type::Custom("Tensor".to_string())));
+        functions.insert("tensor32_zeros".to_string(), (vec![Type::PyObject], Type::Custom("Tensor32".to_string())));
+        functions.insert("tensor32_ones".to_string(), (vec![Type::PyObject], Type::Custom("Tensor32".to_string())));
+        functions.insert("tensor32_randn".to_string(), (vec![Type::PyObject], Type::Custom("Tensor32".to_string())));
+
         functions.insert("mps_random".to_string(), (vec![], Type::Float));
         functions.insert("mps_randint".to_string(), (vec![Type::Int, Type::Int], Type::Int));
         functions.insert("mps_random_seed".to_string(), (vec![Type::Int], Type::Void));
@@ -555,6 +562,8 @@ impl TypeChecker {
                             return Ok(Type::PyObject);
                         } else if method == "sigmoid" || method == "relu" || method == "softmax" || method == "exp" || method == "log" {
                             return Ok(Type::Custom(class_name.clone()));
+                        } else if method == "reshape" || method == "transpose" || method == "squeeze" || method == "matmul" {
+                            return Ok(Type::Custom(class_name.clone()));
                         }
                     }
                     if let Some(info) = self.classes.get(class_name) {
@@ -587,6 +596,38 @@ impl TypeChecker {
                     BinOp::Pow => Ok(Type::Float),
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                         Ok(Type::Bool)
+                    }
+                    BinOp::MatMul => {
+                        let is_tensor_left = match &left_t { Type::Custom(c) => c == "Tensor" || c == "Tensor32" || c.starts_with("Tensor<"), _ => false };
+                        let is_tensor_right = match &right_t { Type::Custom(c) => c == "Tensor" || c == "Tensor32" || c.starts_with("Tensor<"), _ => false };
+                        if is_tensor_left && is_tensor_right {
+                            let is_f32_l = match &left_t { Type::Custom(c) => c == "Tensor32" || c.contains("float32"), _ => false };
+                            let is_f32_r = match &right_t { Type::Custom(c) => c == "Tensor32" || c.contains("float32"), _ => false };
+                            if is_f32_l || is_f32_r {
+                                return Ok(Type::Custom("Tensor32".to_string()));
+                            } else {
+                                return Ok(Type::Custom("Tensor".to_string()));
+                            }
+                        }
+                        let is_matrix_left = match &left_t { Type::Custom(c) => c == "Matrix" || c == "Matrix32" || c.starts_with("Matrix<"), _ => false };
+                        let is_matrix_right = match &right_t { Type::Custom(c) => c == "Matrix" || c == "Matrix32" || c.starts_with("Matrix<"), _ => false };
+                        if is_matrix_left && is_matrix_right {
+                            let is_f32_l = match &left_t { Type::Custom(c) => c == "Matrix32" || c.contains("float32"), _ => false };
+                            let is_f32_r = match &right_t { Type::Custom(c) => c == "Matrix32" || c.contains("float32"), _ => false };
+                            if is_f32_l || is_f32_r {
+                                return Ok(Type::Custom("Matrix32".to_string()));
+                            } else {
+                                return Ok(Type::Custom("Matrix".to_string()));
+                            }
+                        }
+                        if let Type::Custom(class_name) = &left_t {
+                            if let Some(info) = self.classes.get(class_name) {
+                                if let Some((_, ret_t)) = info.methods.get("matmul") {
+                                    return Ok(ret_t.clone());
+                                }
+                            }
+                        }
+                        return Err(format!("Type Error: Operator '@' only supported on Matrix or Tensor types, found '{} @ {}'", left_t, right_t));
                     }
                     _ => {
                         let is_tensor_left = match &left_t { Type::Custom(c) => c == "Tensor" || c == "Tensor32" || c.starts_with("Tensor<"), _ => false };
@@ -742,6 +783,8 @@ impl TypeChecker {
                         } else if method == "shape" || method == "strides" {
                             return Ok(Type::PyObject);
                         } else if method == "sigmoid" || method == "relu" || method == "softmax" || method == "exp" || method == "log" {
+                            return Ok(Type::Custom(class_name.clone()));
+                        } else if method == "reshape" || method == "transpose" || method == "squeeze" || method == "matmul" {
                             return Ok(Type::Custom(class_name.clone()));
                         }
                     }

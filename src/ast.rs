@@ -76,6 +76,7 @@ pub enum BinOp {
     Le,
     Gt,
     Ge,
+    MatMul,
 }
 
 impl std::fmt::Display for BinOp {
@@ -95,10 +96,12 @@ impl std::fmt::Display for BinOp {
             BinOp::Le => "<=",
             BinOp::Gt => ">",
             BinOp::Ge => ">=",
+            BinOp::MatMul => "@",
         };
         write!(f, "{}", op)
     }
 }
+
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]

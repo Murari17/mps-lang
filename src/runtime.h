@@ -2141,6 +2141,572 @@ static inline MPSTensor32* tensor32_softmax(MPSTensor32* a) {
     return c;
 }
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+/* --- Direct Stack-allocated Subscript Indexing Helpers --- */
+static inline double tensor_get_direct(MPSTensor* t, int idx_count, const int* indices) {
+    if (t == NULL) return 0.0;
+    int offset = 0;
+    int limit = idx_count < t->ndim ? idx_count : t->ndim;
+    for (int i = 0; i < limit; i++) {
+        int idx = indices[i];
+        if (idx < 0) idx += t->shape[i];
+        if (idx < 0 || idx >= t->shape[i]) {
+            fprintf(stderr, "Index Error: Tensor index out of bounds.\n");
+            exit(1);
+        }
+        offset += idx * t->strides[i];
+    }
+    return t->data[offset];
+}
+
+static inline void tensor_set_direct(MPSTensor* t, int idx_count, const int* indices, double val) {
+    if (t == NULL) return;
+    int offset = 0;
+    int limit = idx_count < t->ndim ? idx_count : t->ndim;
+    for (int i = 0; i < limit; i++) {
+        int idx = indices[i];
+        if (idx < 0) idx += t->shape[i];
+        if (idx < 0 || idx >= t->shape[i]) {
+            fprintf(stderr, "Index Error: Tensor index out of bounds.\n");
+            exit(1);
+        }
+        offset += idx * t->strides[i];
+    }
+    t->data[offset] = val;
+}
+
+static inline float tensor32_get_direct(MPSTensor32* t, int idx_count, const int* indices) {
+    if (t == NULL) return 0.0f;
+    int offset = 0;
+    int limit = idx_count < t->ndim ? idx_count : t->ndim;
+    for (int i = 0; i < limit; i++) {
+        int idx = indices[i];
+        if (idx < 0) idx += t->shape[i];
+        if (idx < 0 || idx >= t->shape[i]) {
+            fprintf(stderr, "Index Error: Tensor index out of bounds.\n");
+            exit(1);
+        }
+        offset += idx * t->strides[i];
+    }
+    return t->data[offset];
+}
+
+static inline void tensor32_set_direct(MPSTensor32* t, int idx_count, const int* indices, float val) {
+    if (t == NULL) return;
+    int offset = 0;
+    int limit = idx_count < t->ndim ? idx_count : t->ndim;
+    for (int i = 0; i < limit; i++) {
+        int idx = indices[i];
+        if (idx < 0) idx += t->shape[i];
+        if (idx < 0 || idx >= t->shape[i]) {
+            fprintf(stderr, "Index Error: Tensor index out of bounds.\n");
+            exit(1);
+        }
+        offset += idx * t->strides[i];
+    }
+    t->data[offset] = val;
+}
+
+/* --- Tensor MatMul with BLAS Acceleration --- */
+static inline MPSTensor* tensor_matmul(MPSTensor* a, MPSTensor* b) {
+    if (a == NULL || b == NULL) return NULL;
+    if (a->ndim < 2 || b->ndim < 2) {
+        fprintf(stderr, "Error: Tensor matmul requires dimension >= 2 (got %d and %d).\n", a->ndim, b->ndim);
+        exit(1);
+    }
+    
+    int M = a->shape[a->ndim - 2];
+    int K = a->shape[a->ndim - 1];
+    int K2 = b->shape[b->ndim - 2];
+    int N = b->shape[b->ndim - 1];
+    
+    if (K != K2) {
+        fprintf(stderr, "Error: Tensor matmul dimension mismatch (%d vs %d).\n", K, K2);
+        exit(1);
+    }
+    
+    int batch_ndim_a = a->ndim - 2;
+    int batch_ndim_b = b->ndim - 2;
+    int batch_ndim = batch_ndim_a > batch_ndim_b ? batch_ndim_a : batch_ndim_b;
+    
+    int* batch_shape = (int*)malloc((batch_ndim > 0 ? batch_ndim : 1) * sizeof(int));
+    for (int i = 0; i < batch_ndim; i++) {
+        int dim_a = (batch_ndim_a - 1 - i >= 0) ? a->shape[batch_ndim_a - 1 - i] : 1;
+        int dim_b = (batch_ndim_b - 1 - i >= 0) ? b->shape[batch_ndim_b - 1 - i] : 1;
+        if (dim_a != dim_b && dim_a != 1 && dim_b != 1) {
+            fprintf(stderr, "Error: Tensor matmul batch shape mismatch for broadcasting.\n");
+            exit(1);
+        }
+        batch_shape[batch_ndim - 1 - i] = dim_a > dim_b ? dim_a : dim_b;
+    }
+    
+    MPSTensor* c = (MPSTensor*)malloc(sizeof(MPSTensor));
+    c->ndim = batch_ndim + 2;
+    c->shape = (int*)malloc(c->ndim * sizeof(int));
+    for (int i = 0; i < batch_ndim; i++) {
+        c->shape[i] = batch_shape[i];
+    }
+    c->shape[c->ndim - 2] = M;
+    c->shape[c->ndim - 1] = N;
+    
+    c->strides = (int*)malloc(c->ndim * sizeof(int));
+    int current_stride = 1;
+    for (int i = c->ndim - 1; i >= 0; i--) {
+        c->strides[i] = current_stride;
+        current_stride *= c->shape[i];
+    }
+    c->size = current_stride;
+    c->data = (double*)malloc(c->size * sizeof(double));
+    
+    int num_batches = 1;
+    for (int i = 0; i < batch_ndim; i++) num_batches *= batch_shape[i];
+    
+    int* out_idx = (int*)malloc((batch_ndim > 0 ? batch_ndim : 1) * sizeof(int));
+    int* idx_a = (int*)malloc((batch_ndim_a > 0 ? batch_ndim_a : 1) * sizeof(int));
+    int* idx_b = (int*)malloc((batch_ndim_b > 0 ? batch_ndim_b : 1) * sizeof(int));
+    
+    int stride_lda = a->strides[a->ndim - 2];
+    int stride_ldb = b->strides[b->ndim - 2];
+    
+    for (int b_idx = 0; b_idx < num_batches; b_idx++) {
+        int temp = b_idx;
+        for (int d = batch_ndim - 1; d >= 0; d--) {
+            int stride = 1;
+            for (int k = d + 1; k < batch_ndim; k++) stride *= batch_shape[k];
+            out_idx[d] = temp / stride;
+            temp %= stride;
+        }
+        
+        for (int d = 0; d < batch_ndim_a; d++) {
+            int out_d = batch_ndim - batch_ndim_a + d;
+            int val = out_idx[out_d];
+            idx_a[d] = (a->shape[d] == 1) ? 0 : val;
+        }
+        int offset_a = 0;
+        for (int d = 0; d < batch_ndim_a; d++) {
+            offset_a += idx_a[d] * a->strides[d];
+        }
+        
+        for (int d = 0; d < batch_ndim_b; d++) {
+            int out_d = batch_ndim - batch_ndim_b + d;
+            int val = out_idx[out_d];
+            idx_b[d] = (b->shape[d] == 1) ? 0 : val;
+        }
+        int offset_b = 0;
+        for (int d = 0; d < batch_ndim_b; d++) {
+            offset_b += idx_b[d] * b->strides[d];
+        }
+        
+        int offset_c = b_idx * M * N;
+        
+#ifdef MPS_USE_BLAS
+        cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    M, N, K, 1.0,
+                    a->data + offset_a, stride_lda,
+                    b->data + offset_b, stride_ldb,
+                    0.0, c->data + offset_c, N);
+#else
+        for (int i = 0; i < M; i++) {
+            int row_a = offset_a + i * stride_lda;
+            int row_c = offset_c + i * N;
+            for (int j = 0; j < N; j++) {
+                double sum = 0.0;
+                for (int k = 0; k < K; k++) {
+                    sum += a->data[row_a + k * a->strides[a->ndim - 1]] *
+                           b->data[offset_b + k * stride_ldb + j * b->strides[b->ndim - 1]];
+                }
+                c->data[row_c + j] = sum;
+            }
+        }
+#endif
+    }
+    
+    free(batch_shape);
+    free(out_idx);
+    free(idx_a);
+    free(idx_b);
+    return c;
+}
+
+static inline MPSTensor32* tensor32_matmul(MPSTensor32* a, MPSTensor32* b) {
+    if (a == NULL || b == NULL) return NULL;
+    if (a->ndim < 2 || b->ndim < 2) {
+        fprintf(stderr, "Error: Tensor32 matmul requires dimension >= 2 (got %d and %d).\n", a->ndim, b->ndim);
+        exit(1);
+    }
+    
+    int M = a->shape[a->ndim - 2];
+    int K = a->shape[a->ndim - 1];
+    int K2 = b->shape[b->ndim - 2];
+    int N = b->shape[b->ndim - 1];
+    
+    if (K != K2) {
+        fprintf(stderr, "Error: Tensor32 matmul dimension mismatch (%d vs %d).\n", K, K2);
+        exit(1);
+    }
+    
+    int batch_ndim_a = a->ndim - 2;
+    int batch_ndim_b = b->ndim - 2;
+    int batch_ndim = batch_ndim_a > batch_ndim_b ? batch_ndim_a : batch_ndim_b;
+    
+    int* batch_shape = (int*)malloc((batch_ndim > 0 ? batch_ndim : 1) * sizeof(int));
+    for (int i = 0; i < batch_ndim; i++) {
+        int dim_a = (batch_ndim_a - 1 - i >= 0) ? a->shape[batch_ndim_a - 1 - i] : 1;
+        int dim_b = (batch_ndim_b - 1 - i >= 0) ? b->shape[batch_ndim_b - 1 - i] : 1;
+        if (dim_a != dim_b && dim_a != 1 && dim_b != 1) {
+            fprintf(stderr, "Error: Tensor32 matmul batch shape mismatch for broadcasting.\n");
+            exit(1);
+        }
+        batch_shape[batch_ndim - 1 - i] = dim_a > dim_b ? dim_a : dim_b;
+    }
+    
+    MPSTensor32* c = (MPSTensor32*)malloc(sizeof(MPSTensor32));
+    c->ndim = batch_ndim + 2;
+    c->shape = (int*)malloc(c->ndim * sizeof(int));
+    for (int i = 0; i < batch_ndim; i++) {
+        c->shape[i] = batch_shape[i];
+    }
+    c->shape[c->ndim - 2] = M;
+    c->shape[c->ndim - 1] = N;
+    
+    c->strides = (int*)malloc(c->ndim * sizeof(int));
+    int current_stride = 1;
+    for (int i = c->ndim - 1; i >= 0; i--) {
+        c->strides[i] = current_stride;
+        current_stride *= c->shape[i];
+    }
+    c->size = current_stride;
+    c->data = (float*)malloc(c->size * sizeof(float));
+    
+    int num_batches = 1;
+    for (int i = 0; i < batch_ndim; i++) num_batches *= batch_shape[i];
+    
+    int* out_idx = (int*)malloc((batch_ndim > 0 ? batch_ndim : 1) * sizeof(int));
+    int* idx_a = (int*)malloc((batch_ndim_a > 0 ? batch_ndim_a : 1) * sizeof(int));
+    int* idx_b = (int*)malloc((batch_ndim_b > 0 ? batch_ndim_b : 1) * sizeof(int));
+    
+    int stride_lda = a->strides[a->ndim - 2];
+    int stride_ldb = b->strides[b->ndim - 2];
+    
+    for (int b_idx = 0; b_idx < num_batches; b_idx++) {
+        int temp = b_idx;
+        for (int d = batch_ndim - 1; d >= 0; d--) {
+            int stride = 1;
+            for (int k = d + 1; k < batch_ndim; k++) stride *= batch_shape[k];
+            out_idx[d] = temp / stride;
+            temp %= stride;
+        }
+        
+        for (int d = 0; d < batch_ndim_a; d++) {
+            int out_d = batch_ndim - batch_ndim_a + d;
+            int val = out_idx[out_d];
+            idx_a[d] = (a->shape[d] == 1) ? 0 : val;
+        }
+        int offset_a = 0;
+        for (int d = 0; d < batch_ndim_a; d++) {
+            offset_a += idx_a[d] * a->strides[d];
+        }
+        
+        for (int d = 0; d < batch_ndim_b; d++) {
+            int out_d = batch_ndim - batch_ndim_b + d;
+            int val = out_idx[out_d];
+            idx_b[d] = (b->shape[d] == 1) ? 0 : val;
+        }
+        int offset_b = 0;
+        for (int d = 0; d < batch_ndim_b; d++) {
+            offset_b += idx_b[d] * b->strides[d];
+        }
+        
+        int offset_c = b_idx * M * N;
+        
+#ifdef MPS_USE_BLAS
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    M, N, K, 1.0f,
+                    a->data + offset_a, stride_lda,
+                    b->data + offset_b, stride_ldb,
+                    0.0f, c->data + offset_c, N);
+#else
+        for (int i = 0; i < M; i++) {
+            int row_a = offset_a + i * stride_lda;
+            int row_c = offset_c + i * N;
+            for (int j = 0; j < N; j++) {
+                float sum = 0.0f;
+                for (int k = 0; k < K; k++) {
+                    sum += a->data[row_a + k * a->strides[a->ndim - 1]] *
+                           b->data[offset_b + k * stride_ldb + j * b->strides[b->ndim - 1]];
+                }
+                c->data[row_c + j] = sum;
+            }
+        }
+#endif
+    }
+    
+    free(batch_shape);
+    free(out_idx);
+    free(idx_a);
+    free(idx_b);
+    return c;
+}
+
+/* --- Box-Muller Normal Distribution Sampling Helper --- */
+static inline double sample_normal() {
+    double u1 = (double)rand() / RAND_MAX;
+    double u2 = (double)rand() / RAND_MAX;
+    if (u1 < 1e-15) u1 = 1e-15;
+    return sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
+}
+
+/* --- Tensor Constructors / Creation Utilities --- */
+static inline MPSTensor* tensor_zeros(PyObject* shape_obj) {
+    MPSTensor* t = tensor_new(shape_obj);
+    if (t) {
+        memset(t->data, 0, t->size * sizeof(double));
+    }
+    return t;
+}
+
+static inline MPSTensor* tensor_ones(PyObject* shape_obj) {
+    MPSTensor* t = tensor_new(shape_obj);
+    if (t) {
+        for (int i = 0; i < t->size; i++) {
+            t->data[i] = 1.0;
+        }
+    }
+    return t;
+}
+
+static inline MPSTensor* tensor_randn(PyObject* shape_obj) {
+    MPSTensor* t = tensor_new(shape_obj);
+    if (t) {
+        for (int i = 0; i < t->size; i++) {
+            t->data[i] = sample_normal();
+        }
+    }
+    return t;
+}
+
+static inline MPSTensor32* tensor32_zeros(PyObject* shape_obj) {
+    MPSTensor32* t = tensor32_new(shape_obj);
+    if (t) {
+        memset(t->data, 0, t->size * sizeof(float));
+    }
+    return t;
+}
+
+static inline MPSTensor32* tensor32_ones(PyObject* shape_obj) {
+    MPSTensor32* t = tensor32_new(shape_obj);
+    if (t) {
+        for (int i = 0; i < t->size; i++) {
+            t->data[i] = 1.0f;
+        }
+    }
+    return t;
+}
+
+static inline MPSTensor32* tensor32_randn(PyObject* shape_obj) {
+    MPSTensor32* t = tensor32_new(shape_obj);
+    if (t) {
+        for (int i = 0; i < t->size; i++) {
+            t->data[i] = (float)sample_normal();
+        }
+    }
+    return t;
+}
+
+/* --- Tensor Shape Operations (reshape, transpose, squeeze) --- */
+static inline MPSTensor* tensor_reshape(MPSTensor* t, PyObject* new_shape_obj) {
+    if (t == NULL) return NULL;
+    MPSTensor* c = (MPSTensor*)malloc(sizeof(MPSTensor));
+    parse_shape(new_shape_obj, &c->ndim, &c->shape, &c->strides, &c->size);
+    if (t->size != c->size) {
+        fprintf(stderr, "Error: Reshape size mismatch (%d vs %d).\n", t->size, c->size);
+        exit(1);
+    }
+    c->data = (double*)malloc(c->size * sizeof(double));
+    memcpy(c->data, t->data, c->size * sizeof(double));
+    return c;
+}
+
+static inline MPSTensor32* tensor32_reshape(MPSTensor32* t, PyObject* new_shape_obj) {
+    if (t == NULL) return NULL;
+    MPSTensor32* c = (MPSTensor32*)malloc(sizeof(MPSTensor32));
+    parse_shape(new_shape_obj, &c->ndim, &c->shape, &c->strides, &c->size);
+    if (t->size != c->size) {
+        fprintf(stderr, "Error: Reshape size mismatch (%d vs %d).\n", t->size, c->size);
+        exit(1);
+    }
+    c->data = (float*)malloc(c->size * sizeof(float));
+    memcpy(c->data, t->data, c->size * sizeof(float));
+    return c;
+}
+
+static inline MPSTensor* tensor_transpose(MPSTensor* t, int dim1, int dim2) {
+    if (t == NULL) return NULL;
+    if (dim1 < 0) dim1 += t->ndim;
+    if (dim2 < 0) dim2 += t->ndim;
+    if (dim1 < 0 || dim1 >= t->ndim || dim2 < 0 || dim2 >= t->ndim) {
+        fprintf(stderr, "Error: Transpose dimensions out of bounds (%d, %d for ndim %d).\n", dim1, dim2, t->ndim);
+        exit(1);
+    }
+    MPSTensor* c = (MPSTensor*)malloc(sizeof(MPSTensor));
+    c->ndim = t->ndim;
+    c->shape = (int*)malloc(c->ndim * sizeof(int));
+    memcpy(c->shape, t->shape, c->ndim * sizeof(int));
+    c->shape[dim1] = t->shape[dim2];
+    c->shape[dim2] = t->shape[dim1];
+    
+    c->strides = (int*)malloc(c->ndim * sizeof(int));
+    int current_stride = 1;
+    for (int i = c->ndim - 1; i >= 0; i--) {
+        c->strides[i] = current_stride;
+        current_stride *= c->shape[i];
+    }
+    c->size = t->size;
+    c->data = (double*)malloc(c->size * sizeof(double));
+    
+    for (int i = 0; i < c->size; i++) {
+        int temp = i;
+        int offset_t = 0;
+        for (int d = 0; d < c->ndim; d++) {
+            int idx = temp / c->strides[d];
+            temp %= c->strides[d];
+            
+            int t_dim = d;
+            if (d == dim1) t_dim = dim2;
+            else if (d == dim2) t_dim = dim1;
+            
+            offset_t += idx * t->strides[t_dim];
+        }
+        c->data[i] = t->data[offset_t];
+    }
+    return c;
+}
+
+static inline MPSTensor32* tensor32_transpose(MPSTensor32* t, int dim1, int dim2) {
+    if (t == NULL) return NULL;
+    if (dim1 < 0) dim1 += t->ndim;
+    if (dim2 < 0) dim2 += t->ndim;
+    if (dim1 < 0 || dim1 >= t->ndim || dim2 < 0 || dim2 >= t->ndim) {
+        fprintf(stderr, "Error: Transpose dimensions out of bounds (%d, %d for ndim %d).\n", dim1, dim2, t->ndim);
+        exit(1);
+    }
+    MPSTensor32* c = (MPSTensor32*)malloc(sizeof(MPSTensor32));
+    c->ndim = t->ndim;
+    c->shape = (int*)malloc(c->ndim * sizeof(int));
+    memcpy(c->shape, t->shape, c->ndim * sizeof(int));
+    c->shape[dim1] = t->shape[dim2];
+    c->shape[dim2] = t->shape[dim1];
+    
+    c->strides = (int*)malloc(c->ndim * sizeof(int));
+    int current_stride = 1;
+    for (int i = c->ndim - 1; i >= 0; i--) {
+        c->strides[i] = current_stride;
+        current_stride *= c->shape[i];
+    }
+    c->size = t->size;
+    c->data = (float*)malloc(c->size * sizeof(float));
+    
+    for (int i = 0; i < c->size; i++) {
+        int temp = i;
+        int offset_t = 0;
+        for (int d = 0; d < c->ndim; d++) {
+            int idx = temp / c->strides[d];
+            temp %= c->strides[d];
+            
+            int t_dim = d;
+            if (d == dim1) t_dim = dim2;
+            else if (d == dim2) t_dim = dim1;
+            
+            offset_t += idx * t->strides[t_dim];
+        }
+        c->data[i] = t->data[offset_t];
+    }
+    return c;
+}
+
+static inline MPSTensor* tensor_squeeze(MPSTensor* t, int dim) {
+    if (t == NULL) return NULL;
+    if (dim < 0) dim += t->ndim;
+    if (dim < 0 || dim >= t->ndim) {
+        fprintf(stderr, "Error: Squeeze dimension out of bounds (%d for ndim %d).\n", dim, t->ndim);
+        exit(1);
+    }
+    if (t->shape[dim] != 1) {
+        return tensor_reshape(t, tensor_shape(t));
+    }
+    
+    MPSTensor* c = (MPSTensor*)malloc(sizeof(MPSTensor));
+    c->ndim = t->ndim - 1;
+    if (c->ndim <= 0) c->ndim = 1;
+    c->shape = (int*)malloc(c->ndim * sizeof(int));
+    c->strides = (int*)malloc(c->ndim * sizeof(int));
+    
+    int c_d = 0;
+    for (int d = 0; d < t->ndim; d++) {
+        if (d == dim && t->shape[dim] == 1) continue;
+        if (c_d < c->ndim) {
+            c->shape[c_d] = t->shape[d];
+            c_d++;
+        }
+    }
+    if (c_d == 0) {
+        c->shape[0] = 1;
+    }
+    
+    int current_stride = 1;
+    for (int i = c->ndim - 1; i >= 0; i--) {
+        c->strides[i] = current_stride;
+        current_stride *= c->shape[i];
+    }
+    c->size = t->size;
+    c->data = (double*)malloc(c->size * sizeof(double));
+    memcpy(c->data, t->data, c->size * sizeof(double));
+    return c;
+}
+
+static inline MPSTensor32* tensor32_squeeze(MPSTensor32* t, int dim) {
+    if (t == NULL) return NULL;
+    if (dim < 0) dim += t->ndim;
+    if (dim < 0 || dim >= t->ndim) {
+        fprintf(stderr, "Error: Squeeze dimension out of bounds (%d for ndim %d).\n", dim, t->ndim);
+        exit(1);
+    }
+    if (t->shape[dim] != 1) {
+        return tensor32_reshape(t, tensor32_shape(t));
+    }
+    
+    MPSTensor32* c = (MPSTensor32*)malloc(sizeof(MPSTensor32));
+    c->ndim = t->ndim - 1;
+    if (c->ndim <= 0) c->ndim = 1;
+    c->shape = (int*)malloc(c->ndim * sizeof(int));
+    c->strides = (int*)malloc(c->ndim * sizeof(int));
+    
+    int c_d = 0;
+    for (int d = 0; d < t->ndim; d++) {
+        if (d == dim && t->shape[dim] == 1) continue;
+        if (c_d < c->ndim) {
+            c->shape[c_d] = t->shape[d];
+            c_d++;
+        }
+    }
+    if (c_d == 0) {
+        c->shape[0] = 1;
+    }
+    
+    int current_stride = 1;
+    for (int i = c->ndim - 1; i >= 0; i--) {
+        c->strides[i] = current_stride;
+        current_stride *= c->shape[i];
+    }
+    c->size = t->size;
+    c->data = (float*)malloc(c->size * sizeof(float));
+    memcpy(c->data, t->data, c->size * sizeof(float));
+    return c;
+}
+
 /* --- Printing Utilities --- */
 static inline void _print_string(const char* s) {
     printf("%s\n", s);

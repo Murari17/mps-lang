@@ -213,7 +213,7 @@ impl Optimizer {
                             BinOp::Le => Expr::Literal(Literal::Bool(a <= b)),
                             BinOp::Gt => Expr::Literal(Literal::Bool(a > b)),
                             BinOp::Ge => Expr::Literal(Literal::Bool(a >= b)),
-                            BinOp::Pow | BinOp::And | BinOp::Or => {
+                            BinOp::Pow | BinOp::And | BinOp::Or | BinOp::MatMul => {
                                 Expr::Binary { op, left: Box::new(left_folded), right: Box::new(right_folded) }
                             }
                         }
@@ -243,7 +243,7 @@ impl Optimizer {
                             BinOp::Le => Expr::Literal(Literal::Bool(a <= b)),
                             BinOp::Gt => Expr::Literal(Literal::Bool(a > b)),
                             BinOp::Ge => Expr::Literal(Literal::Bool(a >= b)),
-                            BinOp::Pow | BinOp::And | BinOp::Or => {
+                            BinOp::Pow | BinOp::And | BinOp::Or | BinOp::MatMul => {
                                 Expr::Binary { op, left: Box::new(left_folded), right: Box::new(right_folded) }
                             }
                         }
@@ -274,7 +274,7 @@ impl Optimizer {
                             BinOp::Le => Expr::Literal(Literal::Bool(af <= *b)),
                             BinOp::Gt => Expr::Literal(Literal::Bool(af > *b)),
                             BinOp::Ge => Expr::Literal(Literal::Bool(af >= *b)),
-                            BinOp::Pow | BinOp::And | BinOp::Or => {
+                            BinOp::Pow | BinOp::And | BinOp::Or | BinOp::MatMul => {
                                 Expr::Binary { op, left: Box::new(left_folded), right: Box::new(right_folded) }
                             }
                         }
@@ -305,7 +305,7 @@ impl Optimizer {
                             BinOp::Le => Expr::Literal(Literal::Bool(*a <= bf)),
                             BinOp::Gt => Expr::Literal(Literal::Bool(*a > bf)),
                             BinOp::Ge => Expr::Literal(Literal::Bool(*a >= bf)),
-                            BinOp::Pow | BinOp::And | BinOp::Or => {
+                            BinOp::Pow | BinOp::And | BinOp::Or | BinOp::MatMul => {
                                 Expr::Binary { op, left: Box::new(left_folded), right: Box::new(right_folded) }
                             }
                         }

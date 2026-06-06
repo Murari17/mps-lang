@@ -972,6 +972,7 @@ impl Parser {
             Some(Token::Star) => Some(BinOp::Mul),
             Some(Token::Slash) => Some(BinOp::Div),
             Some(Token::Percent) => Some(BinOp::Percent),
+            Some(Token::At) => Some(BinOp::MatMul),
             _ => None,
         }
     }
