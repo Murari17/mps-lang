@@ -10,8 +10,10 @@ pub struct TypeChecker {
     classes: HashMap<String, ClassTypeInfo>,
     functions: HashMap<String, (Vec<Type>, Type)>,
     loop_depth: usize,
+    generic_functions: HashMap<String, (Vec<String>, Vec<crate::ast::Param>, Type, Vec<Stmt>, bool, Vec<String>)>,
 }
 
+#[derive(Clone)]
 struct ClassTypeInfo {
     #[allow(dead_code)]
     base_class: Option<String>,
@@ -64,9 +66,35 @@ impl TypeChecker {
         functions.insert("reduce".to_string(), (vec![Type::PyObject, Type::Void, Type::Void], Type::PyObject));
         functions.insert("len".to_string(), (vec![Type::PyObject], Type::Int));
         functions.insert("matrix_add".to_string(), (vec![Type::Custom("Matrix".to_string()), Type::Custom("Matrix".to_string())], Type::Custom("Matrix".to_string())));
+        functions.insert("matrix_sub".to_string(), (vec![Type::Custom("Matrix".to_string()), Type::Custom("Matrix".to_string())], Type::Custom("Matrix".to_string())));
+        functions.insert("matrix_scale".to_string(), (vec![Type::Custom("Matrix".to_string()), Type::Float], Type::Custom("Matrix".to_string())));
+        functions.insert("matrix_sigmoid".to_string(), (vec![Type::Custom("Matrix".to_string())], Type::Custom("Matrix".to_string())));
+        functions.insert("matrix_softmax".to_string(), (vec![Type::Custom("Matrix".to_string())], Type::Custom("Matrix".to_string())));
+        functions.insert("matrix_exp".to_string(), (vec![Type::Custom("Matrix".to_string())], Type::Custom("Matrix".to_string())));
+        functions.insert("matrix_log".to_string(), (vec![Type::Custom("Matrix".to_string())], Type::Custom("Matrix".to_string())));
         functions.insert("matrix_relu".to_string(), (vec![Type::Custom("Matrix".to_string())], Type::Custom("Matrix".to_string())));
+        
         functions.insert("matrix32_add".to_string(), (vec![Type::Custom("Matrix32".to_string()), Type::Custom("Matrix32".to_string())], Type::Custom("Matrix32".to_string())));
+        functions.insert("matrix32_sub".to_string(), (vec![Type::Custom("Matrix32".to_string()), Type::Custom("Matrix32".to_string())], Type::Custom("Matrix32".to_string())));
+        functions.insert("matrix32_scale".to_string(), (vec![Type::Custom("Matrix32".to_string()), Type::Float32], Type::Custom("Matrix32".to_string())));
+        functions.insert("matrix32_sigmoid".to_string(), (vec![Type::Custom("Matrix32".to_string())], Type::Custom("Matrix32".to_string())));
+        functions.insert("matrix32_softmax".to_string(), (vec![Type::Custom("Matrix32".to_string())], Type::Custom("Matrix32".to_string())));
+        functions.insert("matrix32_exp".to_string(), (vec![Type::Custom("Matrix32".to_string())], Type::Custom("Matrix32".to_string())));
+        functions.insert("matrix32_log".to_string(), (vec![Type::Custom("Matrix32".to_string())], Type::Custom("Matrix32".to_string())));
         functions.insert("matrix32_relu".to_string(), (vec![Type::Custom("Matrix32".to_string())], Type::Custom("Matrix32".to_string())));
+
+        functions.insert("tensor_sigmoid".to_string(), (vec![Type::Custom("Tensor".to_string())], Type::Custom("Tensor".to_string())));
+        functions.insert("tensor_relu".to_string(), (vec![Type::Custom("Tensor".to_string())], Type::Custom("Tensor".to_string())));
+        functions.insert("tensor_softmax".to_string(), (vec![Type::Custom("Tensor".to_string())], Type::Custom("Tensor".to_string())));
+        functions.insert("tensor_exp".to_string(), (vec![Type::Custom("Tensor".to_string())], Type::Custom("Tensor".to_string())));
+        functions.insert("tensor_log".to_string(), (vec![Type::Custom("Tensor".to_string())], Type::Custom("Tensor".to_string())));
+
+        functions.insert("tensor32_sigmoid".to_string(), (vec![Type::Custom("Tensor32".to_string())], Type::Custom("Tensor32".to_string())));
+        functions.insert("tensor32_relu".to_string(), (vec![Type::Custom("Tensor32".to_string())], Type::Custom("Tensor32".to_string())));
+        functions.insert("tensor32_softmax".to_string(), (vec![Type::Custom("Tensor32".to_string())], Type::Custom("Tensor32".to_string())));
+        functions.insert("tensor32_exp".to_string(), (vec![Type::Custom("Tensor32".to_string())], Type::Custom("Tensor32".to_string())));
+        functions.insert("tensor32_log".to_string(), (vec![Type::Custom("Tensor32".to_string())], Type::Custom("Tensor32".to_string())));
+
         functions.insert("mps_random".to_string(), (vec![], Type::Float));
         functions.insert("mps_randint".to_string(), (vec![Type::Int, Type::Int], Type::Int));
         functions.insert("mps_random_seed".to_string(), (vec![Type::Int], Type::Void));
@@ -82,6 +110,7 @@ impl TypeChecker {
             classes: HashMap::new(),
             functions,
             loop_depth: 0,
+            generic_functions: HashMap::new(),
         }
     }
 
@@ -217,9 +246,13 @@ impl TypeChecker {
                         methods,
                     });
                 }
-                Stmt::FunctionDecl { name, params, return_type, .. } => {
-                    let param_types = params.iter().map(|p| p.param_type.clone()).collect();
-                    self.functions.insert(name.clone(), (param_types, return_type.clone()));
+                Stmt::FunctionDecl { name, type_params, params, return_type, body, is_async, decorators } => {
+                    if !type_params.is_empty() {
+                        self.generic_functions.insert(name.clone(), (type_params.clone(), params.clone(), return_type.clone(), body.clone(), *is_async, decorators.clone()));
+                    } else {
+                        let param_types = params.iter().map(|p| p.param_type.clone()).collect();
+                        self.functions.insert(name.clone(), (param_types, return_type.clone()));
+                    }
                 }
                 _ => {}
             }
@@ -366,7 +399,10 @@ impl TypeChecker {
                     return Err("`continue` used outside of a loop".to_string());
                 }
             }
-            Stmt::FunctionDecl { params, body, .. } => {
+            Stmt::FunctionDecl { type_params, params, body, .. } => {
+                if !type_params.is_empty() {
+                    return Ok(());
+                }
                 self.enter_scope();
                 for p in params {
                     self.declare(p.name.clone(), p.param_type.clone())?;
@@ -495,13 +531,30 @@ impl TypeChecker {
                     self.infer_expr_type(arg)?;
                 }
                 if let Type::Custom(class_name) = &inner_t {
-                    if class_name == "Matrix" {
+                    let is_matrix = class_name == "Matrix" || class_name == "Matrix32" || class_name.starts_with("Matrix<");
+                    let is_tensor = class_name == "Tensor" || class_name == "Tensor32" || class_name.starts_with("Tensor<");
+                    if is_matrix {
+                        let is_f32 = class_name == "Matrix32" || class_name.contains("float32");
+                        let elem_t = if is_f32 { Type::Float32 } else { Type::Float };
                         if method == "get" {
-                            return Ok(Type::Optional(Box::new(Type::Float)));
+                            return Ok(Type::Optional(Box::new(elem_t)));
                         } else if method == "set" {
                             return Ok(Type::Void);
                         } else if method == "mul" {
-                            return Ok(Type::Optional(Box::new(Type::Custom("Matrix".to_string()))));
+                            return Ok(Type::Optional(Box::new(Type::Custom(class_name.clone()))));
+                        }
+                    }
+                    if is_tensor {
+                        let is_f32 = class_name == "Tensor32" || class_name.contains("float32");
+                        let elem_t = if is_f32 { Type::Float32 } else { Type::Float };
+                        if method == "get" {
+                            return Ok(Type::Optional(Box::new(elem_t)));
+                        } else if method == "set" {
+                            return Ok(Type::Void);
+                        } else if method == "shape" || method == "strides" {
+                            return Ok(Type::PyObject);
+                        } else if method == "sigmoid" || method == "relu" || method == "softmax" || method == "exp" || method == "log" {
+                            return Ok(Type::Custom(class_name.clone()));
                         }
                     }
                     if let Some(info) = self.classes.get(class_name) {
@@ -536,6 +589,17 @@ impl TypeChecker {
                         Ok(Type::Bool)
                     }
                     _ => {
+                        let is_tensor_left = match &left_t { Type::Custom(c) => c == "Tensor" || c == "Tensor32" || c.starts_with("Tensor<"), _ => false };
+                        let is_tensor_right = match &right_t { Type::Custom(c) => c == "Tensor" || c == "Tensor32" || c.starts_with("Tensor<"), _ => false };
+                        if is_tensor_left && is_tensor_right {
+                            let is_f32_l = match &left_t { Type::Custom(c) => c == "Tensor32" || c.contains("float32"), _ => false };
+                            let is_f32_r = match &right_t { Type::Custom(c) => c == "Tensor32" || c.contains("float32"), _ => false };
+                            if is_f32_l || is_f32_r {
+                                return Ok(Type::Custom("Tensor32".to_string()));
+                            } else {
+                                return Ok(Type::Custom("Tensor".to_string()));
+                            }
+                        }
                         // String concatenation: string + anything = string
                         if *op == BinOp::Add && (left_t == Type::String || right_t == Type::String) {
                             Ok(Type::String)
@@ -551,14 +615,81 @@ impl TypeChecker {
                     }
                 }
             }
-            Expr::Call { name, .. } => {
+            Expr::Call { name, type_args, args } => {
                 if name == "print" || name == "mps_print" || name == "mps_println" {
                     return Ok(Type::Void);
                 }
                 if name == "Matrix" {
                     return Ok(Type::Custom("Matrix".to_string()));
                 }
-                if let Some((_, ret_t)) = self.functions.get(name) {
+                if name == "Matrix32" {
+                    return Ok(Type::Custom("Matrix32".to_string()));
+                }
+                if name == "Tensor" {
+                    return Ok(Type::Custom("Tensor".to_string()));
+                }
+                if name == "Tensor32" {
+                    return Ok(Type::Custom("Tensor32".to_string()));
+                }
+                
+                // Generic template call
+                if self.generic_functions.contains_key(name) {
+                    let (type_params, params, return_type, body, _is_async, _decorators) = self.generic_functions.get(name).unwrap().clone();
+                    if type_params.len() != type_args.len() {
+                        return Err(format!("Generic function '{}' expects {} type arguments, but {} were provided", name, type_params.len(), type_args.len()));
+                    }
+                    let mut mapping = HashMap::new();
+                    for (param, arg) in type_params.iter().zip(type_args.iter()) {
+                        mapping.insert(param.clone(), arg.clone());
+                    }
+                    
+                    let concrete_params: Vec<Type> = params.iter().map(|p| substitute_type(&p.param_type, &mapping)).collect();
+                    let concrete_return = substitute_type(&return_type, &mapping);
+                    let concrete_body: Vec<Stmt> = body.iter().map(|s| substitute_stmt(s, &mapping)).collect();
+                    
+                    if args.len() != concrete_params.len() {
+                        return Err(format!("Function '{}' expects {} arguments, but {} were provided", name, concrete_params.len(), args.len()));
+                    }
+                    for (arg, param_t) in args.iter().zip(concrete_params.iter()) {
+                        let arg_t = self.infer_expr_type(arg)?;
+                        if !self.is_compatible(param_t, &arg_t) {
+                            return Err(format!("Type mismatch in call to '{}': expected '{}' but found '{}'", name, param_t, arg_t));
+                        }
+                    }
+
+                    let concrete_name = format!("{}_{}", name, type_args.iter().map(sanitize_type_name).collect::<Vec<_>>().join("_"));
+
+                    // Dry-run typecheck concrete function body
+                    let mut dry_run = TypeChecker::new(self.source_code.clone(), self.filename.clone());
+                    dry_run.traits = self.traits.clone();
+                    dry_run.classes = self.classes.clone();
+                    dry_run.functions = self.functions.clone();
+                    dry_run.generic_functions = self.generic_functions.clone();
+                    
+                    dry_run.functions.insert(concrete_name, (concrete_params.clone(), concrete_return.clone()));
+                    
+                    dry_run.enter_scope();
+                    for (p_decl, p_concrete) in params.iter().zip(concrete_params.iter()) {
+                        dry_run.declare(p_decl.name.clone(), p_concrete.clone())?;
+                    }
+                    for stmt in &concrete_body {
+                        dry_run.check_statement(stmt)?;
+                    }
+                    dry_run.exit_scope();
+                    
+                    return Ok(concrete_return);
+                }
+
+                if let Some((param_types, ret_t)) = self.functions.get(name) {
+                    if args.len() != param_types.len() {
+                        return Err(format!("Function '{}' expects {} arguments, but {} were provided", name, param_types.len(), args.len()));
+                    }
+                    for (arg, param_t) in args.iter().zip(param_types.iter()) {
+                        let arg_t = self.infer_expr_type(arg)?;
+                        if !self.is_compatible(param_t, &arg_t) {
+                            return Err(format!("Type mismatch in call to '{}': expected '{}' but found '{}'", name, param_t, arg_t));
+                        }
+                    }
                     Ok(ret_t.clone())
                 } else if self.classes.contains_key(name) {
                     Ok(Type::Custom(name.clone()))
@@ -588,13 +719,30 @@ impl TypeChecker {
             Expr::MemberCall { object, method, args } => {
                 let obj_t = self.infer_expr_type(object)?;
                 if let Type::Custom(class_name) = &obj_t {
-                    if class_name == "Matrix" {
+                    let is_matrix = class_name == "Matrix" || class_name == "Matrix32" || class_name.starts_with("Matrix<");
+                    let is_tensor = class_name == "Tensor" || class_name == "Tensor32" || class_name.starts_with("Tensor<");
+                    if is_matrix {
+                        let is_f32 = class_name == "Matrix32" || class_name.contains("float32");
+                        let elem_t = if is_f32 { Type::Float32 } else { Type::Float };
                         if method == "get" {
-                            return Ok(Type::Float);
+                            return Ok(elem_t);
                         } else if method == "set" {
                             return Ok(Type::Void);
                         } else if method == "mul" {
-                            return Ok(Type::Custom("Matrix".to_string()));
+                            return Ok(Type::Custom(class_name.clone()));
+                        }
+                    }
+                    if is_tensor {
+                        let is_f32 = class_name == "Tensor32" || class_name.contains("float32");
+                        let elem_t = if is_f32 { Type::Float32 } else { Type::Float };
+                        if method == "get" {
+                            return Ok(elem_t);
+                        } else if method == "set" {
+                            return Ok(Type::Void);
+                        } else if method == "shape" || method == "strides" {
+                            return Ok(Type::PyObject);
+                        } else if method == "sigmoid" || method == "relu" || method == "softmax" || method == "exp" || method == "log" {
+                            return Ok(Type::Custom(class_name.clone()));
                         }
                     }
                     if let Some(info) = self.classes.get(class_name) {
@@ -605,6 +753,12 @@ impl TypeChecker {
                 }
                 if obj_t == Type::String {
                     match method.as_str() {
+                        "length" => {
+                            if args.len() != 0 {
+                                return Err(format!("Method 'length' on string takes 0 arguments"));
+                            }
+                            return Ok(Type::Int);
+                        }
                         "upper" | "lower" | "trim" => {
                             if args.len() != 0 {
                                 return Err(format!("Method '{}' on string takes 0 arguments", method));
@@ -697,12 +851,24 @@ impl TypeChecker {
             }
             Expr::Subscript { object, .. } => {
                 let obj_t = self.infer_expr_type(object)?;
-                if obj_t == Type::Custom("Matrix".to_string()) {
-                    Ok(Type::Float)
-                } else if obj_t == Type::String {
-                    Ok(Type::String)
-                } else {
-                    Ok(Type::PyObject)
+                match &obj_t {
+                    Type::Custom(class_name) => {
+                        if class_name == "Matrix" || class_name.starts_with("Matrix<") {
+                            let is_f32 = class_name.contains("float32");
+                            if is_f32 { Ok(Type::Float32) } else { Ok(Type::Float) }
+                        } else if class_name == "Matrix32" {
+                            Ok(Type::Float32)
+                        } else if class_name == "Tensor" || class_name.starts_with("Tensor<") {
+                            let is_f32 = class_name.contains("float32");
+                            if is_f32 { Ok(Type::Float32) } else { Ok(Type::Float) }
+                        } else if class_name == "Tensor32" {
+                            Ok(Type::Float32)
+                        } else {
+                            Ok(Type::PyObject)
+                        }
+                    }
+                    Type::String => Ok(Type::String),
+                    _ => Ok(Type::PyObject),
                 }
             }
             Expr::Slice { object, start, end } => {
@@ -748,5 +914,240 @@ impl TypeChecker {
             }
             Expr::Super => Ok(Type::PyObject),
         }
+    }
+}
+
+pub fn sanitize_type_name(ty: &Type) -> String {
+    match ty {
+        Type::Int => "int".to_string(),
+        Type::Float => "float".to_string(),
+        Type::Float32 => "float32".to_string(),
+        Type::String => "string".to_string(),
+        Type::Bool => "bool".to_string(),
+        Type::Void => "void".to_string(),
+        Type::PyObject => "PyObject".to_string(),
+        Type::Custom(s) => {
+            s.replace("<", "_").replace(">", "").replace(",", "_").replace(" ", "")
+        }
+        Type::Optional(inner) => format!("optional_{}", sanitize_type_name(inner)),
+        Type::Function { params, return_type } => {
+            let params_str: Vec<String> = params.iter().map(sanitize_type_name).collect();
+            format!("fn_{}_{}", params_str.join("_"), sanitize_type_name(return_type))
+        }
+    }
+}
+
+pub fn substitute_type(ty: &Type, mapping: &HashMap<String, Type>) -> Type {
+    match ty {
+        Type::Custom(s) => {
+            if let Some(concrete) = mapping.get(s) {
+                concrete.clone()
+            } else if s.contains("<") {
+                let mut replaced = s.clone();
+                for (k, v) in mapping {
+                    let target_less = format!("<{}>", k);
+                    let replacement_less = format!("<{}>", v);
+                    replaced = replaced.replace(&target_less, &replacement_less);
+
+                    let target_comma_left = format!("<{},", k);
+                    let replacement_comma_left = format!("<{},", v);
+                    replaced = replaced.replace(&target_comma_left, &replacement_comma_left);
+
+                    let target_comma_right = format!("{},>", k);
+                    let replacement_comma_right = format!("{},>", v);
+                    replaced = replaced.replace(&target_comma_right, &replacement_comma_right);
+
+                    let target_comma_both = format!(" ,{},", k);
+                    let replacement_comma_both = format!(" ,{},", v);
+                    replaced = replaced.replace(&target_comma_both, &replacement_comma_both);
+                    replaced = replaced.replace(&format!(",{}", k), &format!(",{}", v));
+                    replaced = replaced.replace(&format!("{},", k), &format!("{},", v));
+                }
+                Type::Custom(replaced)
+            } else {
+                Type::Custom(s.clone())
+            }
+        }
+        Type::Optional(inner) => Type::Optional(Box::new(substitute_type(inner, mapping))),
+        Type::Function { params, return_type } => {
+            let new_params = params.iter().map(|p| substitute_type(p, mapping)).collect();
+            let new_return = Box::new(substitute_type(return_type, mapping));
+            Type::Function { params: new_params, return_type: new_return }
+        }
+        other => other.clone(),
+    }
+}
+
+fn substitute_expr(expr: &Expr, mapping: &HashMap<String, Type>) -> Expr {
+    match expr {
+        Expr::Literal(lit) => Expr::Literal(lit.clone()),
+        Expr::Identifier(s) => Expr::Identifier(s.clone()),
+        Expr::Unary { op, operand } => Expr::Unary {
+            op: *op,
+            operand: Box::new(substitute_expr(operand, mapping)),
+        },
+        Expr::Binary { op, left, right } => Expr::Binary {
+            op: *op,
+            left: Box::new(substitute_expr(left, mapping)),
+            right: Box::new(substitute_expr(right, mapping)),
+        },
+        Expr::Call { name, type_args, args } => {
+            let new_type_args = type_args.iter().map(|t| substitute_type(t, mapping)).collect();
+            let new_args = args.iter().map(|a| substitute_expr(a, mapping)).collect();
+            Expr::Call {
+                name: name.clone(),
+                type_args: new_type_args,
+                args: new_args,
+            }
+        }
+        Expr::MemberAccess { object, member } => Expr::MemberAccess {
+            object: Box::new(substitute_expr(object, mapping)),
+            member: member.clone(),
+        },
+        Expr::MemberCall { object, method, args } => Expr::MemberCall {
+            object: Box::new(substitute_expr(object, mapping)),
+            method: method.clone(),
+            args: args.iter().map(|a| substitute_expr(a, mapping)).collect(),
+        },
+        Expr::OptionalMemberAccess { object, member } => Expr::OptionalMemberAccess {
+            object: Box::new(substitute_expr(object, mapping)),
+            member: member.clone(),
+        },
+        Expr::OptionalMemberCall { object, method, args } => Expr::OptionalMemberCall {
+            object: Box::new(substitute_expr(object, mapping)),
+            method: method.clone(),
+            args: args.iter().map(|a| substitute_expr(a, mapping)).collect(),
+        },
+        Expr::Subscript { object, index } => Expr::Subscript {
+            object: Box::new(substitute_expr(object, mapping)),
+            index: Box::new(substitute_expr(index, mapping)),
+        },
+        Expr::ListLiteral(exprs) => Expr::ListLiteral(
+            exprs.iter().map(|e| substitute_expr(e, mapping)).collect()
+        ),
+        Expr::DictLiteral(pairs) => Expr::DictLiteral(
+            pairs.iter().map(|(k, v)| (substitute_expr(k, mapping), substitute_expr(v, mapping))).collect()
+        ),
+        Expr::TupleLiteral(exprs) => Expr::TupleLiteral(
+            exprs.iter().map(|e| substitute_expr(e, mapping)).collect()
+        ),
+        Expr::SuperCall { method, args } => Expr::SuperCall {
+            method: method.clone(),
+            args: args.iter().map(|a| substitute_expr(a, mapping)).collect(),
+        },
+        Expr::Lambda { params, return_type, body } => {
+            let new_params = params.iter().map(|p| crate::ast::Param {
+                name: p.name.clone(),
+                param_type: substitute_type(&p.param_type, mapping),
+            }).collect();
+            Expr::Lambda {
+                params: new_params,
+                return_type: substitute_type(return_type, mapping),
+                body: Box::new(substitute_expr(body, mapping)),
+            }
+        }
+        Expr::AwaitExpr(e) => Expr::AwaitExpr(Box::new(substitute_expr(e, mapping))),
+        Expr::FString { parts } => {
+            let new_parts = parts.iter().map(|p| match p {
+                FStringPart::Text(t) => FStringPart::Text(t.clone()),
+                FStringPart::Expr(e) => FStringPart::Expr(Box::new(substitute_expr(e, mapping))),
+            }).collect();
+            Expr::FString { parts: new_parts }
+        }
+        Expr::Super => Expr::Super,
+        Expr::Slice { object, start, end } => Expr::Slice {
+            object: Box::new(substitute_expr(object, mapping)),
+            start: start.as_ref().map(|s| Box::new(substitute_expr(s, mapping))),
+            end: end.as_ref().map(|e| Box::new(substitute_expr(e, mapping))),
+        },
+        Expr::ListComprehension { element, var_name, iterable } => Expr::ListComprehension {
+            element: Box::new(substitute_expr(element, mapping)),
+            var_name: var_name.clone(),
+            iterable: Box::new(substitute_expr(iterable, mapping)),
+        },
+    }
+}
+
+pub fn substitute_stmt(stmt: &Stmt, mapping: &HashMap<String, Type>) -> Stmt {
+    match stmt {
+        Stmt::FunctionDecl { name, type_params, params, return_type, body, is_async, decorators } => {
+            let new_params = params.iter().map(|p| crate::ast::Param {
+                name: p.name.clone(),
+                param_type: substitute_type(&p.param_type, mapping),
+            }).collect();
+            let new_return = substitute_type(return_type, mapping);
+            let new_body = body.iter().map(|s| substitute_stmt(s, mapping)).collect();
+            Stmt::FunctionDecl {
+                name: name.clone(),
+                type_params: type_params.clone(),
+                params: new_params,
+                return_type: new_return,
+                body: new_body,
+                is_async: *is_async,
+                decorators: decorators.clone(),
+            }
+        }
+        Stmt::ClassDecl { name, base_class, members } => {
+            let new_members = members.iter().map(|s| substitute_stmt(s, mapping)).collect();
+            Stmt::ClassDecl {
+                name: name.clone(),
+                base_class: base_class.clone(),
+                members: new_members,
+            }
+        }
+        Stmt::VariableDecl { name, is_const, var_type, init } => {
+            let new_type = var_type.as_ref().map(|t| substitute_type(t, mapping));
+            let new_init = init.as_ref().map(|e| substitute_expr(e, mapping));
+            Stmt::VariableDecl {
+                name: name.clone(),
+                is_const: *is_const,
+                var_type: new_type,
+                init: new_init,
+            }
+        }
+        Stmt::AssignStmt { lhs, value } => Stmt::AssignStmt {
+            lhs: substitute_expr(lhs, mapping),
+            value: substitute_expr(value, mapping),
+        },
+        Stmt::IfStmt { condition, then_branch, else_branch } => Stmt::IfStmt {
+            condition: substitute_expr(condition, mapping),
+            then_branch: then_branch.iter().map(|s| substitute_stmt(s, mapping)).collect(),
+            else_branch: else_branch.as_ref().map(|eb| eb.iter().map(|s| substitute_stmt(s, mapping)).collect()),
+        },
+        Stmt::WhileStmt { condition, body } => Stmt::WhileStmt {
+            condition: substitute_expr(condition, mapping),
+            body: body.iter().map(|s| substitute_stmt(s, mapping)).collect(),
+        },
+        Stmt::ForStmt { var_name, iterable, body } => Stmt::ForStmt {
+            var_name: var_name.clone(),
+            iterable: substitute_expr(iterable, mapping),
+            body: body.iter().map(|s| substitute_stmt(s, mapping)).collect(),
+        },
+        Stmt::TryCatchStmt { try_branch, catch_var, catch_branch, finally_branch } => Stmt::TryCatchStmt {
+            try_branch: try_branch.iter().map(|s| substitute_stmt(s, mapping)).collect(),
+            catch_var: catch_var.clone(),
+            catch_branch: catch_branch.iter().map(|s| substitute_stmt(s, mapping)).collect(),
+            finally_branch: finally_branch.as_ref().map(|fb| fb.iter().map(|s| substitute_stmt(s, mapping)).collect()),
+        },
+        Stmt::RaiseStmt(e) => Stmt::RaiseStmt(substitute_expr(e, mapping)),
+        Stmt::MatchStmt { value, cases } => {
+            let new_cases = cases.iter().map(|case| {
+                crate::ast::MatchCase {
+                    pattern: case.pattern.clone(),
+                    body: case.body.iter().map(|s| substitute_stmt(s, mapping)).collect(),
+                }
+            }).collect();
+            Stmt::MatchStmt {
+                value: substitute_expr(value, mapping),
+                cases: new_cases,
+            }
+        }
+        Stmt::TupleUnpack { vars, init } => Stmt::TupleUnpack {
+            vars: vars.clone(),
+            init: substitute_expr(init, mapping),
+        },
+        Stmt::ExprStmt(e) => Stmt::ExprStmt(substitute_expr(e, mapping)),
+        Stmt::ReturnStmt(opt_e) => Stmt::ReturnStmt(opt_e.as_ref().map(|e| substitute_expr(e, mapping))),
+        Stmt::TraitDecl { .. } | Stmt::PyImport { .. } | Stmt::Import { .. } | Stmt::FromImport { .. } | Stmt::BreakStmt | Stmt::ContinueStmt => stmt.clone(),
     }
 }

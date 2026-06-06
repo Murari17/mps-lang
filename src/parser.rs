@@ -406,6 +406,24 @@ impl Parser {
             return self.error("MPS uses `fn init()` not `fn __init__()`.\n         Did you mean `fn init(...)`?");
         }
 
+        let mut type_params = Vec::new();
+        if self.peek() == Some(&Token::Lt) {
+            self.advance(); // consume '<'
+            while self.peek() != Some(&Token::Gt) {
+                match self.advance() {
+                    Some(Token::Identifier(tp)) => {
+                        type_params.push(tp);
+                    }
+                    Some(tok) => return self.error(&format!("Expected type parameter name, found {:?}", tok)),
+                    None => return self.error("Expected type parameter name, found EOF"),
+                }
+                if self.peek() == Some(&Token::Comma) {
+                    self.advance(); // consume ','
+                }
+            }
+            self.consume(Token::Gt, "Expected '>' after type parameter list")?;
+        }
+
         self.consume(Token::OpenParen, "Expected '(' after function name")?;
         let mut params = Vec::new();
         if self.peek() != Some(&Token::CloseParen) {
@@ -426,6 +444,7 @@ impl Parser {
         let body = self.parse_block()?;
         Ok(Stmt::FunctionDecl {
             name,
+            type_params,
             params,
             return_type,
             body,
@@ -484,7 +503,24 @@ impl Parser {
                     Some(Token::StringType) => Ok(Type::String),
                     Some(Token::BoolType) => Ok(Type::Bool),
                     Some(Token::VoidType) => Ok(Type::Void),
-                    Some(Token::Identifier(s)) => Ok(Type::Custom(s)),
+                    Some(Token::Identifier(s)) => {
+                        if self.peek() == Some(&Token::Lt) {
+                            self.advance(); // consume '<'
+                            let mut type_args = Vec::new();
+                            if self.peek() != Some(&Token::Gt) {
+                                type_args.push(self.parse_type()?);
+                                while self.peek() == Some(&Token::Comma) {
+                                    self.advance(); // consume ','
+                                    type_args.push(self.parse_type()?);
+                                }
+                            }
+                            self.consume(Token::Gt, "Expected '>' after generic type arguments")?;
+                            let args_strs: Vec<String> = type_args.iter().map(|t| t.to_string()).collect();
+                            Ok(Type::Custom(format!("{}<{}>", s, args_strs.join(", "))))
+                        } else {
+                            Ok(Type::Custom(s))
+                        }
+                    }
                     Some(tok) => self.error(&format!("Expected type name, found {:?}", tok)),
                     None => self.error("Expected type name, found EOF"),
                 }
@@ -809,20 +845,21 @@ impl Parser {
             
             // Rewrite left |> right into nested call nodes!
             left = match right {
-                Expr::Call { name, mut args } => {
+                Expr::Call { name, type_args, mut args } => {
                     args.insert(0, left);
-                    Expr::Call { name, args }
+                    Expr::Call { name, type_args, args }
                 }
                 Expr::MemberCall { object, method, mut args } => {
                     args.insert(0, left);
                     Expr::MemberCall { object, method, args }
                 }
                 Expr::Identifier(name) => {
-                    Expr::Call { name, args: vec![left] }
+                    Expr::Call { name, type_args: Vec::new(), args: vec![left] }
                 }
                 other => {
                     Expr::Call {
                         name: "call_lambda".to_string(), // type checker will lower correctly
+                        type_args: Vec::new(),
                         args: vec![other, left],
                     }
                 }
@@ -939,9 +976,67 @@ impl Parser {
         }
     }
 
+    fn is_generic_call(&self) -> bool {
+        if self.peek() != Some(&Token::Lt) {
+            return false;
+        }
+        let mut n = 1;
+        let mut depth = 1;
+        while let Some(tok) = self.peek_ahead(n) {
+            match tok {
+                Token::Lt => depth += 1,
+                Token::Gt => {
+                    depth -= 1;
+                    if depth == 0 {
+                        // Look at the token after '>'
+                        if self.peek_ahead(n + 1) == Some(&Token::OpenParen) {
+                            return true;
+                        }
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+            n += 1;
+        }
+        false
+    }
+
     fn parse_call_or_primary(&mut self) -> Result<Expr, String> {
         let mut expr = self.parse_primary()?;
         loop {
+            if self.is_generic_call() {
+                self.consume(Token::Lt, "Expected '<'")?;
+                let mut type_args = Vec::new();
+                if self.peek() != Some(&Token::Gt) {
+                    type_args.push(self.parse_type()?);
+                    while self.peek() == Some(&Token::Comma) {
+                        self.advance(); // consume ','
+                        type_args.push(self.parse_type()?);
+                    }
+                }
+                self.consume(Token::Gt, "Expected '>' after generic type arguments")?;
+                
+                self.consume(Token::OpenParen, "Expected '(' after generic type arguments")?;
+                let mut args = Vec::new();
+                if self.peek() != Some(&Token::CloseParen) {
+                    args.push(self.parse_expression()?);
+                    while self.peek() == Some(&Token::Comma) {
+                        self.advance(); // consume ','
+                        args.push(self.parse_expression()?);
+                    }
+                }
+                self.consume(Token::CloseParen, "Expected ')' after arguments")?;
+                
+                match expr {
+                    Expr::Identifier(name) => {
+                        expr = Expr::Call { name, type_args, args };
+                    }
+                    _ => return self.error("Expected identifier for generic call"),
+                }
+                continue;
+            }
+
             match self.peek() {
                 Some(Token::OpenParen) => {
                     self.advance(); // consume '('
@@ -957,7 +1052,7 @@ impl Parser {
 
                     match expr {
                         Expr::Identifier(name) => {
-                            expr = Expr::Call { name, args };
+                            expr = Expr::Call { name, type_args: Vec::new(), args };
                         }
                         Expr::MemberAccess { object, member } => {
                             if let Expr::Super = *object {
@@ -973,6 +1068,13 @@ impl Parser {
                                 };
                             }
                         }
+                        Expr::OptionalMemberAccess { object, member } => {
+                            expr = Expr::OptionalMemberCall {
+                                object,
+                                method: member,
+                                args,
+                            };
+                        }
                         _ => {
                             return self.error("Expected function or method identifier for call");
                         }
@@ -986,6 +1088,18 @@ impl Parser {
                         None => return self.error("Expected member name, found EOF"),
                     };
                     expr = Expr::MemberAccess {
+                        object: Box::new(expr),
+                        member,
+                    };
+                }
+                Some(Token::QuestionDot) => {
+                    self.advance(); // consume '?.'
+                    let member = match self.advance() {
+                        Some(Token::Identifier(s)) => s,
+                        Some(tok) => return self.error(&format!("Expected member name, found {:?}", tok)),
+                        None => return self.error("Expected member name, found EOF"),
+                    };
+                    expr = Expr::OptionalMemberAccess {
                         object: Box::new(expr),
                         member,
                     };
@@ -1475,7 +1589,7 @@ mod tests {
 
         assert_eq!(prog.statements.len(), 1);
         if let Stmt::VariableDecl { init, .. } = &prog.statements[0] {
-            if let Expr::Call { name, args } = init.as_ref().unwrap() {
+            if let Expr::Call { name, args, .. } = init.as_ref().unwrap() {
                 assert_eq!(name, "double");
                 assert_eq!(args.len(), 1);
                 assert!(matches!(args[0], Expr::Identifier(ref n) if n == "x"));

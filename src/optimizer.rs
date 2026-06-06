@@ -96,9 +96,10 @@ impl Optimizer {
 
     fn fold_statement(stmt: Stmt) -> Stmt {
         match stmt {
-            Stmt::FunctionDecl { name, params, return_type, body, is_async, decorators } => {
+            Stmt::FunctionDecl { name, type_params, params, return_type, body, is_async, decorators } => {
                 Stmt::FunctionDecl {
                     name,
+                    type_params,
                     params,
                     return_type,
                     body: Self::optimize_block(body),
@@ -319,9 +320,10 @@ impl Optimizer {
                     _ => Expr::Binary { op, left: Box::new(left_folded), right: Box::new(right_folded) }
                 }
             }
-            Expr::Call { name, args } => {
+            Expr::Call { name, type_args, args } => {
                 Expr::Call {
                     name,
+                    type_args,
                     args: args.into_iter().map(|arg| Self::fold_expression(arg)).collect(),
                 }
             }

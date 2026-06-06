@@ -1262,6 +1262,83 @@ static inline MPSMatrix* matrix_relu(MPSMatrix* a) {
     return c;
 }
 
+static inline MPSMatrix* matrix_sub(MPSMatrix* a, MPSMatrix* b) {
+    if (a == NULL || b == NULL || a->rows != b->rows || a->cols != b->cols) {
+        fprintf(stderr, "Error: Matrix dimensions mismatch for subtraction.\n");
+        exit(1);
+    }
+    MPSMatrix* c = matrix_new(a->rows, a->cols);
+    int size = a->rows * a->cols;
+    for (int i = 0; i < size; i++) {
+        c->data[i] = a->data[i] - b->data[i];
+    }
+    return c;
+}
+
+static inline MPSMatrix* matrix_scale(MPSMatrix* a, double scalar) {
+    if (a == NULL) return NULL;
+    MPSMatrix* c = matrix_new(a->rows, a->cols);
+    int size = a->rows * a->cols;
+    for (int i = 0; i < size; i++) {
+        c->data[i] = a->data[i] * scalar;
+    }
+    return c;
+}
+
+static inline MPSMatrix* matrix_sigmoid(MPSMatrix* a) {
+    if (a == NULL) return NULL;
+    MPSMatrix* c = matrix_new(a->rows, a->cols);
+    int size = a->rows * a->cols;
+    for (int i = 0; i < size; i++) {
+        c->data[i] = 1.0 / (1.0 + exp(-a->data[i]));
+    }
+    return c;
+}
+
+static inline MPSMatrix* matrix_softmax(MPSMatrix* a) {
+    if (a == NULL) return NULL;
+    MPSMatrix* c = matrix_new(a->rows, a->cols);
+    for (int r = 0; r < a->rows; r++) {
+        int offset = r * a->cols;
+        double max_val = a->data[offset];
+        for (int col = 1; col < a->cols; col++) {
+            if (a->data[offset + col] > max_val) {
+                max_val = a->data[offset + col];
+            }
+        }
+        double sum = 0.0;
+        for (int col = 0; col < a->cols; col++) {
+            double ev = exp(a->data[offset + col] - max_val);
+            c->data[offset + col] = ev;
+            sum += ev;
+        }
+        for (int col = 0; col < a->cols; col++) {
+            c->data[offset + col] /= (sum == 0.0 ? 1.0 : sum);
+        }
+    }
+    return c;
+}
+
+static inline MPSMatrix* matrix_exp(MPSMatrix* a) {
+    if (a == NULL) return NULL;
+    MPSMatrix* c = matrix_new(a->rows, a->cols);
+    int size = a->rows * a->cols;
+    for (int i = 0; i < size; i++) {
+        c->data[i] = exp(a->data[i]);
+    }
+    return c;
+}
+
+static inline MPSMatrix* matrix_log(MPSMatrix* a) {
+    if (a == NULL) return NULL;
+    MPSMatrix* c = matrix_new(a->rows, a->cols);
+    int size = a->rows * a->cols;
+    for (int i = 0; i < size; i++) {
+        c->data[i] = log(a->data[i]);
+    }
+    return c;
+}
+
 /* --- float32 MPSMatrix32 operations --- */
 static inline MPSMatrix32* matrix32_new(int rows, int cols) {
     MPSMatrix32* m = (MPSMatrix32*)malloc(sizeof(MPSMatrix32));
@@ -1370,6 +1447,83 @@ static inline MPSMatrix32* matrix32_relu(MPSMatrix32* a) {
     return c;
 }
 
+static inline MPSMatrix32* matrix32_sub(MPSMatrix32* a, MPSMatrix32* b) {
+    if (a == NULL || b == NULL || a->rows != b->rows || a->cols != b->cols) {
+        fprintf(stderr, "Error: Matrix32 dimensions mismatch for subtraction.\n");
+        exit(1);
+    }
+    MPSMatrix32* c = matrix32_new(a->rows, a->cols);
+    int size = a->rows * a->cols;
+    for (int i = 0; i < size; i++) {
+        c->data[i] = a->data[i] - b->data[i];
+    }
+    return c;
+}
+
+static inline MPSMatrix32* matrix32_scale(MPSMatrix32* a, float scalar) {
+    if (a == NULL) return NULL;
+    MPSMatrix32* c = matrix32_new(a->rows, a->cols);
+    int size = a->rows * a->cols;
+    for (int i = 0; i < size; i++) {
+        c->data[i] = a->data[i] * scalar;
+    }
+    return c;
+}
+
+static inline MPSMatrix32* matrix32_sigmoid(MPSMatrix32* a) {
+    if (a == NULL) return NULL;
+    MPSMatrix32* c = matrix32_new(a->rows, a->cols);
+    int size = a->rows * a->cols;
+    for (int i = 0; i < size; i++) {
+        c->data[i] = 1.0f / (1.0f + expf(-a->data[i]));
+    }
+    return c;
+}
+
+static inline MPSMatrix32* matrix32_softmax(MPSMatrix32* a) {
+    if (a == NULL) return NULL;
+    MPSMatrix32* c = matrix32_new(a->rows, a->cols);
+    for (int r = 0; r < a->rows; r++) {
+        int offset = r * a->cols;
+        float max_val = a->data[offset];
+        for (int col = 1; col < a->cols; col++) {
+            if (a->data[offset + col] > max_val) {
+                max_val = a->data[offset + col];
+            }
+        }
+        float sum = 0.0f;
+        for (int col = 0; col < a->cols; col++) {
+            float ev = expf(a->data[offset + col] - max_val);
+            c->data[offset + col] = ev;
+            sum += ev;
+        }
+        for (int col = 0; col < a->cols; col++) {
+            c->data[offset + col] /= (sum == 0.0f ? 1.0f : sum);
+        }
+    }
+    return c;
+}
+
+static inline MPSMatrix32* matrix32_exp(MPSMatrix32* a) {
+    if (a == NULL) return NULL;
+    MPSMatrix32* c = matrix32_new(a->rows, a->cols);
+    int size = a->rows * a->cols;
+    for (int i = 0; i < size; i++) {
+        c->data[i] = expf(a->data[i]);
+    }
+    return c;
+}
+
+static inline MPSMatrix32* matrix32_log(MPSMatrix32* a) {
+    if (a == NULL) return NULL;
+    MPSMatrix32* c = matrix32_new(a->rows, a->cols);
+    int size = a->rows * a->cols;
+    for (int i = 0; i < size; i++) {
+        c->data[i] = logf(a->data[i]);
+    }
+    return c;
+}
+
 /* --- Random Number Generation --- */
 static THREAD_LOCAL uint64_t mps_rng_state = 0x853c49e6748fea9bULL;
 static THREAD_LOCAL uint64_t mps_rng_inc = 0xda3e39cb94b95bdbULL;
@@ -1404,6 +1558,587 @@ static inline int mps_randint(int min, int max) {
     uint32_t range = (uint32_t)(max - min + 1);
     uint32_t val = mps_pcg32_next();
     return min + (int)(val % range);
+}
+
+// Casting helpers needed by tensor functions
+static inline int _to_int_str(const char* s) { return atoi(s); }
+static inline int _to_int_double(double d) { return (int)d; }
+static inline int _to_int_int(int i) { return i; }
+static inline int _to_int_bool(bool b) { return b ? 1 : 0; }
+
+#ifdef MPS_USE_PYTHON
+static inline int _to_int_py(PyObject* o) {
+    if (o == NULL) return 0;
+    return (int)PyLong_AsLong(o);
+}
+#else
+static inline int _to_int_py(PyObject* o) {
+    if (o == NULL) return 0;
+    if (o->type == OBJ_INT) return o->value.int_val;
+    if (o->type == OBJ_FLOAT) return (int)o->value.float_val;
+    if (o->type == OBJ_STRING) return atoi(o->value.string_val);
+    if (o->type == OBJ_BOOL) return o->value.bool_val ? 1 : 0;
+    return 0;
+}
+#endif
+
+#define mps_to_int(X) _Generic((X), \
+    const char*: _to_int_str, \
+    char*: _to_int_str, \
+    double: _to_int_double, \
+    float: _to_int_double, \
+    int: _to_int_int, \
+    bool: _to_int_bool, \
+    PyObject*: _to_int_py \
+)(X)
+
+/* --- N-Dimensional Tensor Definition and Helpers --- */
+typedef struct {
+    double* data;
+    int ndim;
+    int* shape;
+    int* strides;
+    int size;
+} MPSTensor;
+
+typedef struct {
+    float* data;
+    int ndim;
+    int* shape;
+    int* strides;
+    int size;
+} MPSTensor32;
+
+static inline void parse_shape(PyObject* shape_obj, int* ndim_out, int** shape_out, int** strides_out, int* size_out) {
+    int ndim = 0;
+    int* shape = NULL;
+    int* strides = NULL;
+    int size = 1;
+
+    if (shape_obj == NULL) {
+        ndim = 1;
+        shape = (int*)malloc(sizeof(int));
+        shape[0] = 0;
+        strides = (int*)malloc(sizeof(int));
+        strides[0] = 1;
+        size = 0;
+    } else {
+#ifdef MPS_USE_PYTHON
+        if (PyLong_Check(shape_obj)) {
+            ndim = 1;
+            shape = (int*)malloc(sizeof(int));
+            shape[0] = (int)PyLong_AsLong(shape_obj);
+            size = shape[0];
+        } else if (PyList_Check(shape_obj) || PyTuple_Check(shape_obj)) {
+            ndim = (int)PySequence_Size(shape_obj);
+            shape = (int*)malloc(ndim * sizeof(int));
+            for (int i = 0; i < ndim; i++) {
+                PyObject* item = PySequence_GetItem(shape_obj, i);
+                shape[i] = (int)PyLong_AsLong(item);
+                Py_DECREF(item);
+                size *= shape[i];
+            }
+        }
+#else
+        if (shape_obj->type == OBJ_INT) {
+            ndim = 1;
+            shape = (int*)malloc(sizeof(int));
+            shape[0] = shape_obj->value.int_val;
+            size = shape[0];
+        } else if (shape_obj->type == OBJ_LIST || shape_obj->type == OBJ_TUPLE) {
+            ndim = shape_obj->value.list_val->size;
+            shape = (int*)malloc(ndim * sizeof(int));
+            for (int i = 0; i < ndim; i++) {
+                PyObject* item = shape_obj->value.list_val->items[i];
+                shape[i] = item->type == OBJ_INT ? item->value.int_val : 0;
+                size *= shape[i];
+            }
+        }
+#endif
+        else {
+            int val = mps_to_int(shape_obj);
+            ndim = 1;
+            shape = (int*)malloc(sizeof(int));
+            shape[0] = val;
+            size = val;
+        }
+        
+        strides = (int*)malloc(ndim * sizeof(int));
+        int current_stride = 1;
+        for (int i = ndim - 1; i >= 0; i--) {
+            strides[i] = current_stride;
+            current_stride *= shape[i];
+        }
+    }
+
+    *ndim_out = ndim;
+    *shape_out = shape;
+    *strides_out = strides;
+    *size_out = size;
+}
+
+static inline MPSTensor* tensor_new(PyObject* shape_obj) {
+    MPSTensor* t = (MPSTensor*)malloc(sizeof(MPSTensor));
+    parse_shape(shape_obj, &t->ndim, &t->shape, &t->strides, &t->size);
+    t->data = (double*)malloc(t->size * sizeof(double));
+    for (int i = 0; i < t->size; i++) t->data[i] = 0.0;
+    return t;
+}
+
+static inline MPSTensor32* tensor32_new(PyObject* shape_obj) {
+    MPSTensor32* t = (MPSTensor32*)malloc(sizeof(MPSTensor32));
+    parse_shape(shape_obj, &t->ndim, &t->shape, &t->strides, &t->size);
+    t->data = (float*)malloc(t->size * sizeof(float));
+    for (int i = 0; i < t->size; i++) t->data[i] = 0.0f;
+    return t;
+}
+
+static inline void tensor_free(MPSTensor* t) {
+    if (t != NULL) {
+        if (t->shape != NULL) free(t->shape);
+        if (t->strides != NULL) free(t->strides);
+        if (t->data != NULL) free(t->data);
+        free(t);
+    }
+}
+
+static inline void tensor32_free(MPSTensor32* t) {
+    if (t != NULL) {
+        if (t->shape != NULL) free(t->shape);
+        if (t->strides != NULL) free(t->strides);
+        if (t->data != NULL) free(t->data);
+        free(t);
+    }
+}
+
+static inline PyObject* tensor_shape(MPSTensor* t) {
+    if (t == NULL) return Py_None;
+    PyObject* list = PyList_New(t->ndim);
+    for (int i = 0; i < t->ndim; i++) {
+        PyList_SetItem(list, i, to_py(t->shape[i]));
+    }
+    return list;
+}
+
+static inline PyObject* tensor_strides(MPSTensor* t) {
+    if (t == NULL) return Py_None;
+    PyObject* list = PyList_New(t->ndim);
+    for (int i = 0; i < t->ndim; i++) {
+        PyList_SetItem(list, i, to_py(t->strides[i]));
+    }
+    return list;
+}
+
+static inline PyObject* tensor32_shape(MPSTensor32* t) {
+    if (t == NULL) return Py_None;
+    PyObject* list = PyList_New(t->ndim);
+    for (int i = 0; i < t->ndim; i++) {
+        PyList_SetItem(list, i, to_py(t->shape[i]));
+    }
+    return list;
+}
+
+static inline PyObject* tensor32_strides(MPSTensor32* t) {
+    if (t == NULL) return Py_None;
+    PyObject* list = PyList_New(t->ndim);
+    for (int i = 0; i < t->ndim; i++) {
+        PyList_SetItem(list, i, to_py(t->strides[i]));
+    }
+    return list;
+}
+
+static inline int compute_tensor_offset(int ndim, int* shape, int* strides, PyObject* index_obj) {
+    if (index_obj == NULL) return 0;
+    int offset = 0;
+    bool is_int = false;
+    int int_val = 0;
+    
+#ifdef MPS_USE_PYTHON
+    if (PyLong_Check(index_obj)) {
+        is_int = true;
+        int_val = (int)PyLong_AsLong(index_obj);
+    }
+#else
+    if (index_obj->type == OBJ_INT) {
+        is_int = true;
+        int_val = index_obj->value.int_val;
+    }
+#endif
+    
+    if (is_int) {
+        if (ndim == 1) {
+            if (int_val < 0) int_val += shape[0];
+            if (int_val < 0 || int_val >= shape[0]) {
+                fprintf(stderr, "Index Error: Tensor index out of bounds.\n");
+                exit(1);
+            }
+            return int_val * strides[0];
+        } else {
+            int total_size = 1;
+            for (int i = 0; i < ndim; i++) total_size *= shape[i];
+            if (int_val < 0) int_val += total_size;
+            if (int_val < 0 || int_val >= total_size) {
+                fprintf(stderr, "Index Error: Flat tensor index out of bounds.\n");
+                exit(1);
+            }
+            int temp = int_val;
+            for (int i = 0; i < ndim; i++) {
+                int dim_idx = temp / strides[i];
+                offset += dim_idx * strides[i];
+                temp %= strides[i];
+            }
+            return offset;
+        }
+    }
+    
+    int index_len = 0;
+#ifdef MPS_USE_PYTHON
+    if (PyList_Check(index_obj) || PyTuple_Check(index_obj)) {
+        index_len = (int)PySequence_Size(index_obj);
+        for (int i = 0; i < index_len && i < ndim; i++) {
+            PyObject* item = PySequence_GetItem(index_obj, i);
+            int idx = (int)PyLong_AsLong(item);
+            Py_DECREF(item);
+            if (idx < 0) idx += shape[i];
+            if (idx < 0 || idx >= shape[i]) {
+                fprintf(stderr, "Index Error: Tensor index out of bounds.\n");
+                exit(1);
+            }
+            offset += idx * strides[i];
+        }
+    }
+#else
+    if (index_obj->type == OBJ_LIST || index_obj->type == OBJ_TUPLE) {
+        index_len = index_obj->value.list_val->size;
+        for (int i = 0; i < index_len && i < ndim; i++) {
+            PyObject* item = index_obj->value.list_val->items[i];
+            int idx = item->type == OBJ_INT ? item->value.int_val : 0;
+            if (idx < 0) idx += shape[i];
+            if (idx < 0 || idx >= shape[i]) {
+                fprintf(stderr, "Index Error: Tensor index out of bounds.\n");
+                exit(1);
+            }
+            offset += idx * strides[i];
+        }
+    }
+#endif
+    else {
+        int idx = mps_to_int(index_obj);
+        int total_size = 1;
+        for (int i = 0; i < ndim; i++) total_size *= shape[i];
+        if (idx < 0) idx += total_size;
+        if (idx < 0 || idx >= total_size) {
+            fprintf(stderr, "Index Error: Tensor index out of bounds.\n");
+            exit(1);
+        }
+        int temp = idx;
+        for (int i = 0; i < ndim; i++) {
+            int dim_idx = temp / strides[i];
+            offset += dim_idx * strides[i];
+            temp %= strides[i];
+        }
+    }
+    
+    return offset;
+}
+
+static inline double tensor_get(MPSTensor* t, PyObject* index_obj) {
+    if (t == NULL) return 0.0;
+    int offset = compute_tensor_offset(t->ndim, t->shape, t->strides, index_obj);
+    return t->data[offset];
+}
+
+static inline void tensor_set(MPSTensor* t, PyObject* index_obj, double val) {
+    if (t == NULL) return;
+    int offset = compute_tensor_offset(t->ndim, t->shape, t->strides, index_obj);
+    t->data[offset] = val;
+}
+
+static inline float tensor32_get(MPSTensor32* t, PyObject* index_obj) {
+    if (t == NULL) return 0.0f;
+    int offset = compute_tensor_offset(t->ndim, t->shape, t->strides, index_obj);
+    return t->data[offset];
+}
+
+static inline void tensor32_set(MPSTensor32* t, PyObject* index_obj, float val) {
+    if (t == NULL) return;
+    int offset = compute_tensor_offset(t->ndim, t->shape, t->strides, index_obj);
+    t->data[offset] = val;
+}
+
+static inline bool broadcast_shapes(int ndim_a, int* shape_a, int ndim_b, int* shape_b, int* ndim_out, int** shape_out) {
+    int ndim = ndim_a > ndim_b ? ndim_a : ndim_b;
+    int* shape = (int*)malloc(ndim * sizeof(int));
+    
+    for (int i = 0; i < ndim; i++) {
+        int dim_a = (ndim_a - 1 - i >= 0) ? shape_a[ndim_a - 1 - i] : 1;
+        int dim_b = (ndim_b - 1 - i >= 0) ? shape_b[ndim_b - 1 - i] : 1;
+        
+        if (dim_a != dim_b && dim_a != 1 && dim_b != 1) {
+            free(shape);
+            return false;
+        }
+        shape[ndim - 1 - i] = dim_a > dim_b ? dim_a : dim_b;
+    }
+    
+    *ndim_out = ndim;
+    *shape_out = shape;
+    return true;
+}
+
+static inline int get_broadcast_offset(int ndim_out, int* out_idx, int ndim_in, int* shape_in, int* strides_in) {
+    int offset = 0;
+    for (int i = 0; i < ndim_in; i++) {
+        int out_dim_idx = ndim_out - 1 - (ndim_in - 1 - i);
+        int idx = out_idx[out_dim_idx];
+        if (shape_in[i] == 1) {
+            idx = 0;
+        }
+        offset += idx * strides_in[i];
+    }
+    return offset;
+}
+
+static inline void flat_to_multi(int ndim, int* shape, int* strides, int flat_idx, int* out_idx) {
+    int temp = flat_idx;
+    for (int i = 0; i < ndim; i++) {
+        out_idx[i] = temp / strides[i];
+        temp %= strides[i];
+    }
+}
+
+static inline MPSTensor* tensor_broadcast_op(MPSTensor* a, MPSTensor* b, char op) {
+    if (a == NULL || b == NULL) return NULL;
+    int ndim_out;
+    int* shape_out;
+    if (!broadcast_shapes(a->ndim, a->shape, b->ndim, b->shape, &ndim_out, &shape_out)) {
+        fprintf(stderr, "Error: Tensor dimensions mismatch for broadcasting.\n");
+        exit(1);
+    }
+    
+    PyObject* shape_list = PyList_New(ndim_out);
+    for (int i = 0; i < ndim_out; i++) {
+        PyList_SetItem(shape_list, i, to_py(shape_out[i]));
+    }
+    
+    MPSTensor* c = tensor_new(shape_list);
+    Py_DECREF(shape_list);
+    free(shape_out);
+    
+    int* out_idx = (int*)malloc(ndim_out * sizeof(int));
+    for (int i = 0; i < c->size; i++) {
+        flat_to_multi(c->ndim, c->shape, c->strides, i, out_idx);
+        int offset_a = get_broadcast_offset(c->ndim, out_idx, a->ndim, a->shape, a->strides);
+        int offset_b = get_broadcast_offset(c->ndim, out_idx, b->ndim, b->shape, b->strides);
+        
+        double val_a = a->data[offset_a];
+        double val_b = b->data[offset_b];
+        double res = 0.0;
+        if (op == '+') res = val_a + val_b;
+        else if (op == '-') res = val_a - val_b;
+        else if (op == '*') res = val_a * val_b;
+        else if (op == '/') res = val_b != 0.0 ? val_a / val_b : 0.0;
+        
+        c->data[i] = res;
+    }
+    free(out_idx);
+    return c;
+}
+
+static inline MPSTensor* tensor_add(MPSTensor* a, MPSTensor* b) { return tensor_broadcast_op(a, b, '+'); }
+static inline MPSTensor* tensor_sub(MPSTensor* a, MPSTensor* b) { return tensor_broadcast_op(a, b, '-'); }
+static inline MPSTensor* tensor_mul(MPSTensor* a, MPSTensor* b) { return tensor_broadcast_op(a, b, '*'); }
+static inline MPSTensor* tensor_div(MPSTensor* a, MPSTensor* b) { return tensor_broadcast_op(a, b, '/'); }
+
+static inline MPSTensor32* tensor32_broadcast_op(MPSTensor32* a, MPSTensor32* b, char op) {
+    if (a == NULL || b == NULL) return NULL;
+    int ndim_out;
+    int* shape_out;
+    if (!broadcast_shapes(a->ndim, a->shape, b->ndim, b->shape, &ndim_out, &shape_out)) {
+        fprintf(stderr, "Error: Tensor32 dimensions mismatch for broadcasting.\n");
+        exit(1);
+    }
+    
+    PyObject* shape_list = PyList_New(ndim_out);
+    for (int i = 0; i < ndim_out; i++) {
+        PyList_SetItem(shape_list, i, to_py(shape_out[i]));
+    }
+    
+    MPSTensor32* c = tensor32_new(shape_list);
+    Py_DECREF(shape_list);
+    free(shape_out);
+    
+    int* out_idx = (int*)malloc(ndim_out * sizeof(int));
+    for (int i = 0; i < c->size; i++) {
+        flat_to_multi(c->ndim, c->shape, c->strides, i, out_idx);
+        int offset_a = get_broadcast_offset(c->ndim, out_idx, a->ndim, a->shape, a->strides);
+        int offset_b = get_broadcast_offset(c->ndim, out_idx, b->ndim, b->shape, b->strides);
+        
+        float val_a = a->data[offset_a];
+        float val_b = b->data[offset_b];
+        float res = 0.0f;
+        if (op == '+') res = val_a + val_b;
+        else if (op == '-') res = val_a - val_b;
+        else if (op == '*') res = val_a * val_b;
+        else if (op == '/') res = val_b != 0.0f ? val_a / val_b : 0.0f;
+        
+        c->data[i] = res;
+    }
+    free(out_idx);
+    return c;
+}
+
+static inline MPSTensor32* tensor32_add(MPSTensor32* a, MPSTensor32* b) { return tensor32_broadcast_op(a, b, '+'); }
+static inline MPSTensor32* tensor32_sub(MPSTensor32* a, MPSTensor32* b) { return tensor32_broadcast_op(a, b, '-'); }
+static inline MPSTensor32* tensor32_mul(MPSTensor32* a, MPSTensor32* b) { return tensor32_broadcast_op(a, b, '*'); }
+static inline MPSTensor32* tensor32_div(MPSTensor32* a, MPSTensor32* b) { return tensor32_broadcast_op(a, b, '/'); }
+
+static inline MPSTensor* tensor_sigmoid(MPSTensor* a) {
+    if (a == NULL) return NULL;
+    PyObject* shape_list = tensor_shape(a);
+    MPSTensor* c = tensor_new(shape_list);
+    Py_DECREF(shape_list);
+    for (int i = 0; i < a->size; i++) {
+        c->data[i] = 1.0 / (1.0 + exp(-a->data[i]));
+    }
+    return c;
+}
+
+static inline MPSTensor* tensor_relu(MPSTensor* a) {
+    if (a == NULL) return NULL;
+    PyObject* shape_list = tensor_shape(a);
+    MPSTensor* c = tensor_new(shape_list);
+    Py_DECREF(shape_list);
+    for (int i = 0; i < a->size; i++) {
+        c->data[i] = a->data[i] > 0.0 ? a->data[i] : 0.0;
+    }
+    return c;
+}
+
+static inline MPSTensor* tensor_exp(MPSTensor* a) {
+    if (a == NULL) return NULL;
+    PyObject* shape_list = tensor_shape(a);
+    MPSTensor* c = tensor_new(shape_list);
+    Py_DECREF(shape_list);
+    for (int i = 0; i < a->size; i++) {
+        c->data[i] = exp(a->data[i]);
+    }
+    return c;
+}
+
+static inline MPSTensor* tensor_log(MPSTensor* a) {
+    if (a == NULL) return NULL;
+    PyObject* shape_list = tensor_shape(a);
+    MPSTensor* c = tensor_new(shape_list);
+    Py_DECREF(shape_list);
+    for (int i = 0; i < a->size; i++) {
+        c->data[i] = log(a->data[i]);
+    }
+    return c;
+}
+
+static inline MPSTensor* tensor_softmax(MPSTensor* a) {
+    if (a == NULL) return NULL;
+    PyObject* shape_list = tensor_shape(a);
+    MPSTensor* c = tensor_new(shape_list);
+    Py_DECREF(shape_list);
+    
+    int last_dim_size = a->shape[a->ndim - 1];
+    int num_slices = a->size / last_dim_size;
+    
+    for (int s = 0; s < num_slices; s++) {
+        int offset = s * last_dim_size;
+        double max_val = a->data[offset];
+        for (int i = 1; i < last_dim_size; i++) {
+            if (a->data[offset + i] > max_val) {
+                max_val = a->data[offset + i];
+            }
+        }
+        double sum = 0.0;
+        for (int i = 0; i < last_dim_size; i++) {
+            double ev = exp(a->data[offset + i] - max_val);
+            c->data[offset + i] = ev;
+            sum += ev;
+        }
+        for (int i = 0; i < last_dim_size; i++) {
+            c->data[offset + i] /= (sum == 0.0 ? 1.0 : sum);
+        }
+    }
+    return c;
+}
+
+static inline MPSTensor32* tensor32_sigmoid(MPSTensor32* a) {
+    if (a == NULL) return NULL;
+    PyObject* shape_list = tensor32_shape(a);
+    MPSTensor32* c = tensor32_new(shape_list);
+    Py_DECREF(shape_list);
+    for (int i = 0; i < a->size; i++) {
+        c->data[i] = 1.0f / (1.0f + expf(-a->data[i]));
+    }
+    return c;
+}
+
+static inline MPSTensor32* tensor32_relu(MPSTensor32* a) {
+    if (a == NULL) return NULL;
+    PyObject* shape_list = tensor32_shape(a);
+    MPSTensor32* c = tensor32_new(shape_list);
+    Py_DECREF(shape_list);
+    for (int i = 0; i < a->size; i++) {
+        c->data[i] = a->data[i] > 0.0f ? a->data[i] : 0.0f;
+    }
+    return c;
+}
+
+static inline MPSTensor32* tensor32_exp(MPSTensor32* a) {
+    if (a == NULL) return NULL;
+    PyObject* shape_list = tensor32_shape(a);
+    MPSTensor32* c = tensor32_new(shape_list);
+    Py_DECREF(shape_list);
+    for (int i = 0; i < a->size; i++) {
+        c->data[i] = expf(a->data[i]);
+    }
+    return c;
+}
+
+static inline MPSTensor32* tensor32_log(MPSTensor32* a) {
+    if (a == NULL) return NULL;
+    PyObject* shape_list = tensor32_shape(a);
+    MPSTensor32* c = tensor32_new(shape_list);
+    Py_DECREF(shape_list);
+    for (int i = 0; i < a->size; i++) {
+        c->data[i] = logf(a->data[i]);
+    }
+    return c;
+}
+
+static inline MPSTensor32* tensor32_softmax(MPSTensor32* a) {
+    if (a == NULL) return NULL;
+    PyObject* shape_list = tensor32_shape(a);
+    MPSTensor32* c = tensor32_new(shape_list);
+    Py_DECREF(shape_list);
+    
+    int last_dim_size = a->shape[a->ndim - 1];
+    int num_slices = a->size / last_dim_size;
+    
+    for (int s = 0; s < num_slices; s++) {
+        int offset = s * last_dim_size;
+        float max_val = a->data[offset];
+        for (int i = 1; i < last_dim_size; i++) {
+            if (a->data[offset + i] > max_val) {
+                max_val = a->data[offset + i];
+            }
+        }
+        float sum = 0.0f;
+        for (int i = 0; i < last_dim_size; i++) {
+            float ev = expf(a->data[offset + i] - max_val);
+            c->data[offset + i] = ev;
+            sum += ev;
+        }
+        for (int i = 0; i < last_dim_size; i++) {
+            c->data[offset + i] /= (sum == 0.0f ? 1.0f : sum);
+        }
+    }
+    return c;
 }
 
 /* --- Printing Utilities --- */
@@ -1542,6 +2277,44 @@ static inline void _print_matrix32(MPSMatrix32* m) {
     }
 }
 
+static inline void _print_tensor(MPSTensor* t) {
+    if (t == NULL) {
+        printf("Tensor: NULL\n");
+        return;
+    }
+    printf("Tensor (ndim=%d, size=%d): shape=[", t->ndim, t->size);
+    for (int i = 0; i < t->ndim; i++) {
+        printf("%d%s", t->shape[i], i < t->ndim - 1 ? ", " : "");
+    }
+    printf("]\n");
+    printf("  [ ");
+    int max_elements = t->size > 10 ? 10 : t->size;
+    for (int i = 0; i < max_elements; i++) {
+        printf("%g ", t->data[i]);
+    }
+    if (t->size > 10) printf("... ");
+    printf("]\n");
+}
+
+static inline void _print_tensor32(MPSTensor32* t) {
+    if (t == NULL) {
+        printf("Tensor32: NULL\n");
+        return;
+    }
+    printf("Tensor32 (ndim=%d, size=%d): shape=[", t->ndim, t->size);
+    for (int i = 0; i < t->ndim; i++) {
+        printf("%d%s", t->shape[i], i < t->ndim - 1 ? ", " : "");
+    }
+    printf("]\n");
+    printf("  [ ");
+    int max_elements = t->size > 10 ? 10 : t->size;
+    for (int i = 0; i < max_elements; i++) {
+        printf("%g ", (double)t->data[i]);
+    }
+    if (t->size > 10) printf("... ");
+    printf("]\n");
+}
+
 #define print(X) _Generic((X), \
     const char*: _print_string, \
     char*: _print_string, \
@@ -1551,7 +2324,9 @@ static inline void _print_matrix32(MPSMatrix32* m) {
     bool: _print_bool, \
     PyObject*: _print_pyobject, \
     MPSMatrix*: _print_matrix, \
-    MPSMatrix32*: _print_matrix32 \
+    MPSMatrix32*: _print_matrix32, \
+    MPSTensor*: _print_tensor, \
+    MPSTensor32*: _print_tensor32 \
 )(X)
 
 #define mps_print(X) print(X)
@@ -1619,37 +2394,7 @@ static inline const char* mps_input(const char* prompt) {
     return buf;
 }
 
-// Casting
-static inline int _to_int_str(const char* s) { return atoi(s); }
-static inline int _to_int_double(double d) { return (int)d; }
-static inline int _to_int_int(int i) { return i; }
-static inline int _to_int_bool(bool b) { return b ? 1 : 0; }
 
-#ifdef MPS_USE_PYTHON
-static inline int _to_int_py(PyObject* o) {
-    if (o == NULL) return 0;
-    return (int)PyLong_AsLong(o);
-}
-#else
-static inline int _to_int_py(PyObject* o) {
-    if (o == NULL) return 0;
-    if (o->type == OBJ_INT) return o->value.int_val;
-    if (o->type == OBJ_FLOAT) return (int)o->value.float_val;
-    if (o->type == OBJ_STRING) return atoi(o->value.string_val);
-    if (o->type == OBJ_BOOL) return o->value.bool_val ? 1 : 0;
-    return 0;
-}
-#endif
-
-#define mps_to_int(X) _Generic((X), \
-    const char*: _to_int_str, \
-    char*: _to_int_str, \
-    double: _to_int_double, \
-    float: _to_int_double, \
-    int: _to_int_int, \
-    bool: _to_int_bool, \
-    PyObject*: _to_int_py \
-)(X)
 
 static inline double _to_float_str(const char* s) { return atof(s); }
 static inline double _to_float_double(double d) { return d; }

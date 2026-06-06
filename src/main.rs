@@ -114,6 +114,7 @@ fn print_usage() {
     println!("  --emit-c             Output transpiled C code (no compilation)");
     println!("  --emit-ast           Print parsed AST to stdout");
     println!("  --emit-so            Output a shared library (.dll or .so) instead of an executable");
+    println!("  --use-blas           Link with OpenBLAS for faster matrix multiplications");
     println!("  -o, --output <path>  Specify output binary path");
     println!("  -i, --repl           Start the interactive REPL shell");
     println!("  -h, --help           Show this help message");
@@ -143,6 +144,7 @@ fn main() {
     let mut emit_c = false;
     let mut emit_ast = false;
     let mut emit_so = false;
+    let mut use_blas = false;
     let mut output_bin_path: Option<PathBuf> = None;
 
     let mut i = 1;
@@ -170,6 +172,10 @@ fn main() {
             }
             "--emit-so" => {
                 emit_so = true;
+                i += 1;
+            }
+            "--use-blas" => {
+                use_blas = true;
                 i += 1;
             }
             "-o" | "--output" => {
@@ -245,7 +251,7 @@ fn main() {
             initial_source = source_code;
         }
 
-        run_repl(initial_statements, initial_source);
+        run_repl(initial_statements, initial_source, use_blas);
         return;
     }
 
@@ -378,6 +384,9 @@ fn main() {
             if emit_so {
                 cmd.arg("/LD").arg("/DMPS_EMIT_SO");
             }
+            if use_blas {
+                cmd.arg("/DMPS_USE_BLAS");
+            }
             
             if has_py_imports {
                 if let Some(paths) = discover_python_paths() {
@@ -385,9 +394,14 @@ fn main() {
                     cmd.arg("/link");
                     cmd.arg(format!("/LIBPATH:{}", paths.libs_dir));
                     cmd.arg(format!("{}.lib", paths.lib_name));
+                    if use_blas {
+                        cmd.arg("openblas.lib");
+                    }
                 } else {
                     eprintln!("[MPS] Warning: pyimport was used but CPython paths could not be discovered.");
                 }
+            } else if use_blas {
+                cmd.arg("/link").arg("openblas.lib");
             }
             cmd.status()
         } else if cc == "cl_vcvars" {
@@ -397,14 +411,22 @@ fn main() {
                 use std::os::windows::process::CommandExt;
                 let mut cmd = Command::new("cmd");
                 let vcvars_path = find_vcvars().unwrap();
-                let extra_flags = if emit_so { " /LD /DMPS_EMIT_SO" } else { "" };
+                let mut extra_flags = if emit_so { " /LD /DMPS_EMIT_SO".to_string() } else { "".to_string() };
+                if use_blas {
+                    extra_flags.push_str(" /DMPS_USE_BLAS");
+                }
                 let mut cl_cmd = format!("call \"{}\" && cl /std:c11 /O2 /fp:fast{} /Fe:\"{}\" \"{}\"", vcvars_path, extra_flags, output_bin.display(), temp_c_path.display());
                 if has_py_imports {
                     if let Some(paths) = discover_python_paths() {
                         cl_cmd.push_str(&format!(" /I\"{}\" /link /LIBPATH:\"{}\" \"{}.lib\"", paths.include_dir, paths.libs_dir, paths.lib_name));
+                        if use_blas {
+                            cl_cmd.push_str(" \"openblas.lib\"");
+                        }
                     } else {
                         eprintln!("[MPS] Warning: pyimport was used but CPython paths could not be discovered.");
                     }
+                } else if use_blas {
+                    cl_cmd.push_str(" /link \"openblas.lib\"");
                 }
                 cmd.raw_arg(format!("/c {}", cl_cmd));
                 cmd.status()
@@ -426,6 +448,9 @@ fn main() {
             if emit_so {
                 cmd.arg("-shared").arg("-fPIC").arg("-DMPS_EMIT_SO");
             }
+            if use_blas {
+                cmd.arg("-DMPS_USE_BLAS");
+            }
 
             if has_py_imports {
                 if let Some(paths) = discover_python_paths() {
@@ -435,6 +460,9 @@ fn main() {
                 } else {
                     eprintln!("[MPS] Warning: pyimport was used but CPython paths could not be discovered.");
                 }
+            }
+            if use_blas {
+                cmd.arg("-lopenblas");
             }
             cmd.status()
         };
@@ -491,13 +519,14 @@ fn main() {
     }
 }
 
-fn run_repl(initial_statements: Vec<ast::Stmt>, initial_source: String) {
+fn run_repl(initial_statements: Vec<ast::Stmt>, initial_source: String, use_blas: bool) {
     println!("Makes Python Slow (MPS) Interactive REPL v0.1.0");
     println!("Type \"exit\" or \"quit\" to exit.");
     println!();
 
     let mut session_statements = initial_statements;
     let mut session_source_code = initial_source;
+    let mut session_needs_recompile = false;
 
     loop {
         let first_line = match read_line("mps>>> ") {
@@ -556,8 +585,50 @@ fn run_repl(initial_statements: Vec<ast::Stmt>, initial_source: String) {
             format!("{}\n{}", session_source_code, input_str)
         };
 
-        let combined_stmts = [session_statements.clone(), new_program.statements.clone()].concat();
-        let test_program = ast::Program { statements: combined_stmts.clone() };
+        let mut proposed_statements = session_statements.clone();
+        
+        let has_new_decls = new_program.statements.iter().any(|s| matches!(s, ast::Stmt::FunctionDecl { .. } | ast::Stmt::ClassDecl { .. }));
+        let has_new_exec = new_program.statements.iter().any(|s| !matches!(s, ast::Stmt::FunctionDecl { .. } | ast::Stmt::ClassDecl { .. } | ast::Stmt::Import { .. } | ast::Stmt::FromImport { .. } | ast::Stmt::PyImport { .. }));
+
+        if has_new_decls {
+            for stmt in &new_program.statements {
+                match stmt {
+                    ast::Stmt::FunctionDecl { name, .. } => {
+                        proposed_statements.retain(|s| {
+                            if let ast::Stmt::FunctionDecl { name: existing_name, .. } = s {
+                                existing_name != name
+                            } else {
+                                true
+                            }
+                        });
+                    }
+                    ast::Stmt::ClassDecl { name, .. } => {
+                        proposed_statements.retain(|s| {
+                            if let ast::Stmt::ClassDecl { name: existing_name, .. } = s {
+                                existing_name != name
+                            } else {
+                                true
+                            }
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            for stmt in &new_program.statements {
+                if matches!(stmt, ast::Stmt::FunctionDecl { .. } | ast::Stmt::ClassDecl { .. }) {
+                    proposed_statements.push(stmt.clone());
+                }
+            }
+            session_needs_recompile = true;
+        }
+
+        let combined_stmts = [proposed_statements.clone(), new_program.statements.iter().filter(|s| !matches!(s, ast::Stmt::FunctionDecl { .. } | ast::Stmt::ClassDecl { .. })).cloned().collect::<Vec<_>>()].concat();
+        let mut test_program = ast::Program { statements: combined_stmts.clone() };
+        let mut already_imported = std::collections::HashSet::new();
+        if let Err(e) = resolve_imports(&mut test_program, Path::new("."), &mut already_imported) {
+            eprintln!("Error resolving imports: {}", e);
+            continue;
+        }
 
         let mut typechecker = typechecker::TypeChecker::new(test_source.clone(), "repl".to_string());
         if let Err(_) = typechecker.typecheck_program(&test_program) {
@@ -565,169 +636,345 @@ fn run_repl(initial_statements: Vec<ast::Stmt>, initial_source: String) {
             continue;
         }
 
-        let mut compiled_program = test_program;
-        let last_idx = compiled_program.statements.len() - 1;
-        if let ast::Stmt::ExprStmt(ref expr) = compiled_program.statements[last_idx] {
-            if let Ok(expr_type) = typechecker.infer_expr_type(expr) {
-                if expr_type != ast::Type::Void {
-                    let is_print = match expr {
-                        ast::Expr::Call { name, .. } => name == "print" || name == "mps_print" || name == "mps_println",
-                        _ => false,
-                    };
-                    if !is_print {
-                        let wrapped = ast::Expr::Call {
-                            name: "print".to_string(),
-                            args: vec![expr.clone()],
-                        };
-                        compiled_program.statements[last_idx] = ast::Stmt::ExprStmt(wrapped);
-                    }
-                }
-            }
-        }
-
-        let mut codegen = Codegen::new();
-        let c_code = match codegen.transpile_program(&compiled_program) {
-            Ok(code) => code,
-            Err(e) => {
-                eprintln!("{}", e);
-                continue;
-            }
-        };
-        let has_py_imports = codegen.has_py_imports();
-
-        let temp_c_path = Path::new("_repl_temp.c");
-        let temp_bin_path = if cfg!(target_os = "windows") {
-            Path::new("_repl_temp.exe")
-        } else {
-            Path::new("_repl_temp")
-        };
-        let temp_header_path = Path::new("runtime.h");
-
-        if let Err(e) = fs::write(temp_c_path, &c_code) {
-            eprintln!("Error: Failed to write temp C file: {}", e);
-            continue;
-        }
-        if let Err(e) = fs::write(temp_header_path, RUNTIME_H_CONTENT) {
-            eprintln!("Error: Failed to write runtime header: {}", e);
-            let _ = fs::remove_file(temp_c_path);
-            continue;
-        }
-
         let c_compiler = check_c_compiler();
         if c_compiler.is_none() {
             eprintln!("Error: No host C compiler (gcc, clang, or cl) was found in your PATH.");
-            let _ = fs::remove_file(temp_c_path);
-            let _ = fs::remove_file(temp_header_path);
             continue;
         }
         let cc = c_compiler.unwrap();
 
-        let compile_output;
-        if cc == "cl" {
-            let mut compile_cmd = Command::new("cl");
-            compile_cmd.arg("/std:c11")
-                       .arg(format!("/Fe:{}", temp_bin_path.display()))
-                       .arg(temp_c_path);
-            if has_py_imports {
-                if let Some(paths) = discover_python_paths() {
-                    compile_cmd.arg(format!("/I{}", paths.include_dir));
-                    compile_cmd.arg("/link");
-                    compile_cmd.arg(format!("/LIBPATH:{}", paths.libs_dir));
-                    compile_cmd.arg(format!("{}.lib", paths.lib_name));
+        let has_session_obj = proposed_statements.iter().any(|s| matches!(s, ast::Stmt::FunctionDecl { .. } | ast::Stmt::ClassDecl { .. }));
+        let mut session_compile_success = true;
+
+        if has_session_obj && session_needs_recompile {
+            let mut session_decls = Vec::new();
+            for stmt in &proposed_statements {
+                match stmt {
+                    ast::Stmt::FunctionDecl { .. } | ast::Stmt::ClassDecl { .. } | ast::Stmt::Import { .. } | ast::Stmt::FromImport { .. } | ast::Stmt::PyImport { .. } => {
+                        session_decls.push(stmt.clone());
+                    }
+                    _ => {}
                 }
             }
-            compile_output = compile_cmd.output();
-        } else if cc == "cl_vcvars" {
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                let mut compile_cmd = Command::new("cmd");
-                let vcvars_path = find_vcvars().unwrap();
-                let mut cl_cmd = format!("call \"{}\" >nul && cl /std:c11 /Fe:\"{}\" \"{}\"", vcvars_path, temp_bin_path.display(), temp_c_path.display());
+
+            let mut session_program = ast::Program { statements: session_decls };
+            let mut session_already_imported = std::collections::HashSet::new();
+            if let Err(e) = resolve_imports(&mut session_program, Path::new("."), &mut session_already_imported) {
+                eprintln!("Error resolving imports for session: {}", e);
+                continue;
+            }
+
+            let mut session_codegen = Codegen::new();
+            session_codegen.is_repl_session = true;
+            let session_c_code = match session_codegen.transpile_program(&session_program) {
+                Ok(code) => code,
+                Err(e) => {
+                    eprintln!("Transpilation error for session: {}", e);
+                    continue;
+                }
+            };
+
+            if let Err(e) = fs::write("_repl_session.c", &session_c_code) {
+                eprintln!("Error: Failed to write session C file: {}", e);
+                continue;
+            }
+            if let Err(e) = fs::write("runtime.h", RUNTIME_H_CONTENT) {
+                eprintln!("Error: Failed to write runtime header: {}", e);
+                let _ = fs::remove_file("_repl_session.c");
+                continue;
+            }
+
+            let session_compile_output = if cc == "cl" {
+                let mut compile_cmd = Command::new("cl");
+                compile_cmd.arg("/std:c11")
+                           .arg("/c")
+                           .arg("_repl_session.c")
+                           .arg("/Fo:_repl_session.obj");
+                if use_blas {
+                    compile_cmd.arg("/DMPS_USE_BLAS");
+                }
+                if session_codegen.has_py_imports() {
+                    if let Some(paths) = discover_python_paths() {
+                        compile_cmd.arg(format!("/I{}", paths.include_dir));
+                    }
+                }
+                compile_cmd.output()
+            } else if cc == "cl_vcvars" {
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    let mut compile_cmd = Command::new("cmd");
+                    let vcvars_path = find_vcvars().unwrap();
+                    let mut extra_flags = if use_blas { " /DMPS_USE_BLAS".to_string() } else { "".to_string() };
+                    if session_codegen.has_py_imports() {
+                        if let Some(paths) = discover_python_paths() {
+                            extra_flags.push_str(&format!(" /I\"{}\"", paths.include_dir));
+                        }
+                    }
+                    let cl_cmd = format!("call \"{}\" >nul && cl /std:c11 /c{} _repl_session.c /Fo:_repl_session.obj", vcvars_path, extra_flags);
+                    compile_cmd.raw_arg(format!("/c {}", cl_cmd));
+                    compile_cmd.output()
+                }
+                #[cfg(not(windows))]
+                {
+                    Err(std::io::ErrorKind::Unsupported.into())
+                }
+            } else {
+                let mut compile_cmd = Command::new(cc);
+                compile_cmd.arg("-O3")
+                           .arg("-ffast-math")
+                           .arg("-march=native")
+                           .arg("-c")
+                           .arg("_repl_session.c")
+                           .arg("-o")
+                           .arg("_repl_session.o");
+                if use_blas {
+                    compile_cmd.arg("-DMPS_USE_BLAS");
+                }
+                if session_codegen.has_py_imports() {
+                    if let Some(paths) = discover_python_paths() {
+                        compile_cmd.arg(format!("-I{}", paths.include_dir));
+                    }
+                }
+                compile_cmd.output()
+            };
+
+            let _ = fs::remove_file("_repl_session.c");
+            let _ = fs::remove_file("runtime.h");
+
+            match session_compile_output {
+                Ok(output) if output.status.success() => {
+                    session_needs_recompile = false;
+                }
+                Ok(output) => {
+                    eprintln!("Error: Session compilation failed.");
+                    use std::io::Write;
+                    let _ = std::io::stderr().write_all(&output.stdout);
+                    let _ = std::io::stderr().write_all(&output.stderr);
+                    session_compile_success = false;
+                }
+                Err(e) => {
+                    eprintln!("Error: Failed to run C compiler for session: {}", e);
+                    session_compile_success = false;
+                }
+            }
+        }
+
+        if !session_compile_success {
+            continue;
+        }
+
+        if has_new_exec {
+            let mut compiled_program = test_program;
+            let last_idx = compiled_program.statements.len() - 1;
+            if let ast::Stmt::ExprStmt(ref expr) = compiled_program.statements[last_idx] {
+                if let Ok(expr_type) = typechecker.infer_expr_type(expr) {
+                    if expr_type != ast::Type::Void {
+                        let is_print = match expr {
+                            ast::Expr::Call { name, .. } => name == "print" || name == "mps_print" || name == "mps_println",
+                            _ => false,
+                        };
+                        if !is_print {
+                            let wrapped = ast::Expr::Call {
+                                name: "print".to_string(),
+                                type_args: Vec::new(),
+                                args: vec![expr.clone()],
+                            };
+                            compiled_program.statements[last_idx] = ast::Stmt::ExprStmt(wrapped);
+                        }
+                    }
+                }
+            }
+
+            let mut temp_codegen = Codegen::new();
+            for stmt in &proposed_statements {
+                match stmt {
+                    ast::Stmt::FunctionDecl { name, .. } => {
+                        temp_codegen.session_defined_funcs.insert(name.clone());
+                    }
+                    ast::Stmt::ClassDecl { name, .. } => {
+                        temp_codegen.session_defined_classes.insert(name.clone());
+                    }
+                    _ => {}
+                }
+            }
+            temp_codegen.is_repl_session = false;
+
+            let c_code = match temp_codegen.transpile_program(&compiled_program) {
+                Ok(code) => code,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    continue;
+                }
+            };
+            let has_py_imports = temp_codegen.has_py_imports();
+
+            let temp_c_path = Path::new("_repl_temp.c");
+            let temp_bin_path = if cfg!(target_os = "windows") {
+                Path::new("_repl_temp.exe")
+            } else {
+                Path::new("_repl_temp")
+            };
+            let temp_header_path = Path::new("runtime.h");
+
+            if let Err(e) = fs::write(temp_c_path, &c_code) {
+                eprintln!("Error: Failed to write temp C file: {}", e);
+                continue;
+            }
+            if let Err(e) = fs::write(temp_header_path, RUNTIME_H_CONTENT) {
+                eprintln!("Error: Failed to write runtime header: {}", e);
+                let _ = fs::remove_file(temp_c_path);
+                continue;
+            }
+
+            let compile_output = if cc == "cl" {
+                let mut compile_cmd = Command::new("cl");
+                compile_cmd.arg("/std:c11")
+                           .arg(format!("/Fe:{}", temp_bin_path.display()))
+                           .arg(temp_c_path);
+                if has_session_obj {
+                    compile_cmd.arg("_repl_session.obj");
+                }
+                if use_blas {
+                    compile_cmd.arg("/DMPS_USE_BLAS");
+                }
                 if has_py_imports {
                     if let Some(paths) = discover_python_paths() {
-                        cl_cmd.push_str(&format!(" /I\"{}\" /link /LIBPATH:\"{}\" \"{}.lib\"", paths.include_dir, paths.libs_dir, paths.lib_name));
+                        compile_cmd.arg(format!("/I{}", paths.include_dir));
+                        compile_cmd.arg("/link");
+                        compile_cmd.arg(format!("/LIBPATH:{}", paths.libs_dir));
+                        compile_cmd.arg(format!("{}.lib", paths.lib_name));
+                        if use_blas {
+                            compile_cmd.arg("openblas.lib");
+                        }
                     }
+                } else if use_blas {
+                    compile_cmd.arg("/link").arg("openblas.lib");
                 }
-                compile_cmd.raw_arg(format!("/c {}", cl_cmd));
-                compile_output = compile_cmd.output();
-            }
-            #[cfg(not(windows))]
-            {
-                compile_output = Err(std::io::ErrorKind::Unsupported.into());
-            }
-        } else {
-            let mut compile_cmd = Command::new(cc);
-            compile_cmd.arg(temp_c_path)
-                       .arg("-o")
-                       .arg(temp_bin_path);
-            if has_py_imports {
-                if let Some(paths) = discover_python_paths() {
-                    compile_cmd.arg(format!("-I{}", paths.include_dir));
-                    compile_cmd.arg(format!("-L{}", paths.libs_dir));
-                    compile_cmd.arg(format!("-l{}", paths.lib_name));
-                }
-            }
-            compile_output = compile_cmd.output();
-        }
-
-        let _ = fs::remove_file(temp_c_path);
-        let _ = fs::remove_file(temp_header_path);
-        if cc == "cl" || cc == "cl_vcvars" {
-            let _ = fs::remove_file("_repl_temp.obj");
-        }
-
-        match compile_output {
-            Ok(output) if output.status.success() => {
-                let run_bin = if temp_bin_path.is_absolute() {
-                    temp_bin_path.to_path_buf()
-                } else if let Ok(abs) = std::fs::canonicalize(temp_bin_path) {
-                    abs
-                } else {
-                    Path::new(".").join(temp_bin_path)
-                };
-
-                let run_status = Command::new(&run_bin).status();
-                let _ = fs::remove_file(&run_bin);
-
-                match run_status {
-                    Ok(s) if s.success() => {
-                        // Success! Update session statements and source
-                        for stmt in new_program.statements {
-                            let is_pure_print = match &stmt {
-                                ast::Stmt::ExprStmt(ast::Expr::Call { name, .. }) => name == "print" || name == "mps_print" || name == "mps_println",
-                                _ => false,
-                            };
-                            if !is_pure_print {
-                                session_statements.push(stmt);
+                compile_cmd.output()
+            } else if cc == "cl_vcvars" {
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    let mut compile_cmd = Command::new("cmd");
+                    let vcvars_path = find_vcvars().unwrap();
+                    let extra_flags = if use_blas { " /DMPS_USE_BLAS" } else { "" };
+                    let link_obj = if has_session_obj { " \"_repl_session.obj\"" } else { "" };
+                    let mut cl_cmd = format!("call \"{}\" >nul && cl /std:c11 /Fe:\"{}\" \"{}\"{}", vcvars_path, temp_bin_path.display(), temp_c_path.display(), link_obj);
+                    if !extra_flags.is_empty() {
+                        cl_cmd.push_str(extra_flags);
+                    }
+                    if has_py_imports {
+                        if let Some(paths) = discover_python_paths() {
+                            cl_cmd.push_str(&format!(" /I\"{}\" /link /LIBPATH:\"{}\" \"{}.lib\"", paths.include_dir, paths.libs_dir, paths.lib_name));
+                            if use_blas {
+                                cl_cmd.push_str(" \"openblas.lib\"");
                             }
                         }
-                        if session_source_code.is_empty() {
-                            session_source_code = input_str;
-                        } else {
-                            session_source_code.push_str("\n");
-                            session_source_code.push_str(&input_str);
-                        }
+                    } else if use_blas {
+                        cl_cmd.push_str(" /link \"openblas.lib\"");
                     }
-                    Ok(s) => {
-                        eprintln!("Execution finished with exit code: {:?}", s.code());
-                    }
-                    Err(e) => {
-                        eprintln!("Error: Failed to run binary: {}", e);
+                    compile_cmd.raw_arg(format!("/c {}", cl_cmd));
+                    compile_cmd.output()
+                }
+                #[cfg(not(windows))]
+                {
+                    Err(std::io::ErrorKind::Unsupported.into())
+                }
+            } else {
+                let mut compile_cmd = Command::new(cc);
+                compile_cmd.arg(temp_c_path);
+                if has_session_obj {
+                    compile_cmd.arg("_repl_session.o");
+                }
+                compile_cmd.arg("-o")
+                           .arg(temp_bin_path);
+                if use_blas {
+                    compile_cmd.arg("-DMPS_USE_BLAS");
+                }
+                if has_py_imports {
+                    if let Some(paths) = discover_python_paths() {
+                        compile_cmd.arg(format!("-I{}", paths.include_dir));
+                        compile_cmd.arg(format!("-L{}", paths.libs_dir));
+                        compile_cmd.arg(format!("-l{}", paths.lib_name));
                     }
                 }
+                if use_blas {
+                    compile_cmd.arg("-lopenblas");
+                }
+                compile_cmd.output()
+            };
+
+            let _ = fs::remove_file(temp_c_path);
+            let _ = fs::remove_file(temp_header_path);
+            if cc == "cl" || cc == "cl_vcvars" {
+                let _ = fs::remove_file("_repl_temp.obj");
             }
-            Ok(output) => {
-                eprintln!("Error: C compilation failed.");
-                use std::io::Write;
-                let _ = std::io::stderr().write_all(&output.stdout);
-                let _ = std::io::stderr().write_all(&output.stderr);
+
+            match compile_output {
+                Ok(output) if output.status.success() => {
+                    let run_bin = if temp_bin_path.is_absolute() {
+                        temp_bin_path.to_path_buf()
+                    } else if let Ok(abs) = std::fs::canonicalize(temp_bin_path) {
+                        abs
+                    } else {
+                        Path::new(".").join(temp_bin_path)
+                    };
+
+                    let run_status = Command::new(&run_bin).status();
+                    let _ = fs::remove_file(&run_bin);
+
+                    match run_status {
+                        Ok(s) if s.success() => {
+                            session_statements = proposed_statements;
+                            for stmt in new_program.statements {
+                                let is_pure_print = match &stmt {
+                                    ast::Stmt::ExprStmt(ast::Expr::Call { name, .. }) => name == "print" || name == "mps_print" || name == "mps_println",
+                                    _ => false,
+                                };
+                                let is_decl = matches!(stmt, ast::Stmt::FunctionDecl { .. } | ast::Stmt::ClassDecl { .. });
+                                if !is_pure_print && !is_decl {
+                                    session_statements.push(stmt);
+                                }
+                            }
+                            if session_source_code.is_empty() {
+                                session_source_code = input_str;
+                            } else {
+                                session_source_code.push_str("\n");
+                                session_source_code.push_str(&input_str);
+                            }
+                        }
+                        Ok(s) => {
+                            eprintln!("Execution finished with exit code: {:?}", s.code());
+                        }
+                        Err(e) => {
+                            eprintln!("Error: Failed to run binary: {}", e);
+                        }
+                    }
+                }
+                Ok(output) => {
+                    eprintln!("Error: C compilation failed.");
+                    use std::io::Write;
+                    let _ = std::io::stderr().write_all(&output.stdout);
+                    let _ = std::io::stderr().write_all(&output.stderr);
+                }
+                Err(e) => {
+                    eprintln!("Error: Failed to run C compiler: {}", e);
+                }
             }
-            Err(e) => {
-                eprintln!("Error: Failed to run C compiler: {}", e);
+        } else {
+            session_statements = proposed_statements;
+            if session_source_code.is_empty() {
+                session_source_code = input_str;
+            } else {
+                session_source_code.push_str("\n");
+                session_source_code.push_str(&input_str);
             }
         }
     }
+
+    let _ = fs::remove_file("_repl_session.obj");
+    let _ = fs::remove_file("_repl_session.o");
 }
 
 fn read_line(prompt: &str) -> Option<String> {
@@ -1238,14 +1485,19 @@ fn format_program(program: &ast::Program) -> String {
 fn format_statement(stmt: &ast::Stmt, indent: usize) -> String {
     let ind = "    ".repeat(indent);
     match stmt {
-        ast::Stmt::FunctionDecl { name, params, return_type, body, is_async, decorators } => {
+        ast::Stmt::FunctionDecl { name, type_params, params, return_type, body, is_async, decorators } => {
             let mut out = String::new();
             for dec in decorators {
                 out.push_str(&format!("{}@{}\n", ind, dec));
             }
             let async_prefix = if *is_async { "async " } else { "" };
+            let type_params_str = if type_params.is_empty() {
+                "".to_string()
+            } else {
+                format!("<{}>", type_params.join(", "))
+            };
             let param_strs: Vec<String> = params.iter().map(|p| format!("{}: {}", p.name, p.param_type)).collect();
-            out.push_str(&format!("{}fn {}{}({}) -> {}:\n", ind, async_prefix, name, param_strs.join(", "), return_type));
+            out.push_str(&format!("{}fn {}{}{}({}) -> {}:\n", ind, async_prefix, name, type_params_str, param_strs.join(", "), return_type));
             for s in body {
                 out.push_str(&format_statement(s, indent + 1));
             }
@@ -1378,9 +1630,14 @@ fn format_expression(expr: &ast::Expr) -> String {
         ast::Expr::Identifier(name) => name.clone(),
         ast::Expr::Unary { op, operand } => format!("{}{}", op, format_expression(operand)),
         ast::Expr::Binary { op, left, right } => format!("({} {} {})", format_expression(left), op, format_expression(right)),
-        ast::Expr::Call { name, args } => {
+        ast::Expr::Call { name, type_args, args } => {
+            let type_args_str = if type_args.is_empty() {
+                "".to_string()
+            } else {
+                format!("<{}>", type_args.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", "))
+            };
             let arg_strs: Vec<String> = args.iter().map(format_expression).collect();
-            format!("{}({})", name, arg_strs.join(", "))
+            format!("{}{}({})", name, type_args_str, arg_strs.join(", "))
         }
         ast::Expr::MemberAccess { object, member } => format!("{}.{}", format_expression(object), member),
         ast::Expr::MemberCall { object, method, args } => {

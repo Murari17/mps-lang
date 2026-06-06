@@ -123,6 +123,7 @@ pub enum Expr {
     },
     Call {
         name: String,
+        type_args: Vec<Type>,
         args: Vec<Expr>,
     },
     MemberAccess {
@@ -205,6 +206,7 @@ pub struct MatchCase {
 pub enum Stmt {
     FunctionDecl {
         name: String,
+        type_params: Vec<String>,
         params: Vec<Param>,
         return_type: Type,
         body: Vec<Stmt>,
